@@ -1,4 +1,5 @@
 import argparse
+import os
 import warnings
 
 
@@ -54,12 +55,20 @@ def parse_args(input_args = None):
         default = None,
         help = "The prompt to specify images in the same class as provided instance images.",
     )
+
     parser.add_argument(
-        "--with_prior_preservation",
-        default = False,
-        action = "store_true",
-        help = "Flag to add prior preservation loss.",
+        "--prior_preservation_mode",
+        choices = ["image", "base_img_otf", "base_img_preinit", "off"],
+        help = "Enable type of prior preservation loss.",
     )
+
+    parser.add_argument(
+        "--prior_preservation_base_otf_half",
+        action = "store_true",
+        default = False,
+        help = "Enable type of prior preservation loss.",
+    )
+
     parser.add_argument("--prior_loss_weight", type = float, default = 1.0, help = "The weight of prior preservation loss.")
     parser.add_argument(
         "--num_class_images",
@@ -100,13 +109,18 @@ def parse_args(input_args = None):
         action = "store_true",
         help = "Whether to train the text encoder. If set, the text encoder should be float32 precision.",
     )
+
     parser.add_argument(
         "--train_batch_size", type = int, default = 4, help = "Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
+        "--regs_per_image", type = int, default = 1, help = "Number of regularization images adder per image into each batch."
+    )
+
+    parser.add_argument(
         "--sample_batch_size", type = int, default = 4, help = "Batch size (per device) for sampling images."
     )
-    parser.add_argument("--num_train_epochs", type = int, default = 1)
+    parser.add_argument("--num_train_epochs", type = int, default = 500)
     parser.add_argument(
         "--max_train_steps",
         type = int,
@@ -230,7 +244,7 @@ def parse_args(input_args = None):
     parser.add_argument(
         "--report_to",
         type = str,
-        default = "tensorboard",
+        default = None,
         help = (
             'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
@@ -256,6 +270,14 @@ def parse_args(input_args = None):
             "Run validation every X steps. Validation consists of running the prompt"
             " `args.validation_prompt` multiple times: `args.num_validation_images`"
             " and logging the images."
+        ),
+    )
+    parser.add_argument(
+        "--validation_batch_size",
+        type = int,
+        default = 100,
+        help = (
+            "batch size for creating validation images"
         ),
     )
     parser.add_argument(
@@ -302,6 +324,12 @@ def parse_args(input_args = None):
             " See: https://www.crosslabs.org//blog/diffusion-with-offset-noise for more information."
         ),
     )
+    parser.add_argument(
+        "--cpu",
+        action = "store_true",
+        default = False,
+        help = ("run on CPU"),
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -312,7 +340,10 @@ def parse_args(input_args = None):
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    if args.with_prior_preservation:
+    if args.prior_preservation_mode.lower() == "off":
+        args.prior_preservation_mode = None
+
+    if args.prior_preservation_mode:
         if args.class_data_dir is None:
             raise ValueError("You must specify a data directory for class images.")
         if args.class_prompt is None:
