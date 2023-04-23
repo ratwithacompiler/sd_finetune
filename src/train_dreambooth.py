@@ -28,14 +28,15 @@ import logging
 import math
 import os
 import queue
-import time
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import accelerate
 import numpy as np
-import torch
+# import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import torch.utils.data
@@ -44,11 +45,12 @@ import transformers.utils.logging
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from huggingface_hub import create_repo, upload_folder
+from fastai.optimizer import OptimWrapper
 from packaging import version
+from torch.utils.data import DataLoader
 
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, PretrainedConfig
+from transformers import AutoTokenizer, PretrainedConfig, CLIPTextModel
 
 import diffusers
 from diffusers import (
@@ -63,8 +65,12 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
 from arguments import parse_args
-from dataload import PromptDataset, DreamBoothDataset, TransformedDataset, transforms_random_crop
+from dataload import PromptDataset, DreamBoothDataset, TransformedDataset, transforms_random_crop, StaticDataset
 from utils import Timer, Timed, timed_wrapper, _make_cached_caller_targ
+
+from fastai.callback.core import Callback
+from fastai.learner import Learner
+from fastai.data.core import DataLoaders
 
 IS_DEV = os.environ.get("DEV") == "1"
 
@@ -125,7 +131,7 @@ def clean_mem():
 
 @torch.no_grad()
 def log_validation(
-        text_encoder, tokenizer, unet, vae, args, accelerator, weight_dtype, epoch,
+        text_encoder, tokenizer, unet, vae, args, accelerator, epoch,
         pipeline = None,
         num_inference_steps = 22,
 ):
@@ -147,7 +153,7 @@ def log_validation(
             unet = accelerator.unwrap_model(unet),
             vae = accelerator.unwrap_model(vae),
             revision = args.revision,
-            torch_dtype = weight_dtype,
+            torch_dtype = vae.dtype,
             safety_checker = None,
             feature_extractor = None,
             requires_safety_checker = False
@@ -247,7 +253,7 @@ def create_class_images(args, accelerator, num_new_images, class_images_dir: Pat
     logger.info(f"Number of class images to sample: {num_new_images}.")
 
     sample_dataset = PromptDataset(args.class_prompt, num_new_images)
-    sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size = args.sample_batch_size)
+    sample_dataloader = DataLoader(sample_dataset, batch_size = args.sample_batch_size)
 
     sample_dataloader = accelerator.prepare(sample_dataloader)
     pipeline.to(accelerator.device)
@@ -265,6 +271,29 @@ def create_class_images(args, accelerator, num_new_images, class_images_dir: Pat
         torch.cuda.empty_cache()
 
 
+@dataclass
+class TrainContext():
+    unet: UNet2DConditionModel
+    tokenizer: AutoTokenizer
+    text_encoder: CLIPTextModel
+    vae: AutoencoderKL
+    noise_scheduler: DDPMScheduler
+    model: "Model" = None
+    args: any = None
+    accelerator = None
+    step = None
+
+    def __post_init__(self):
+        self.encode_text_cached, self.encode_text_stats = _make_cached_caller_targ(self.text_encoder)
+        self.set_cached(False)
+
+    def set_cached(self, cached = True):
+        self.encode_text = self.encode_text_cached if cached else self._encode_text
+
+    def _encode_text(self, ids):
+        return self.text_encoder(ids)
+
+
 def load_tokenizer(args):
     if args.tokenizer_name:
         return AutoTokenizer.from_pretrained(args.tokenizer_name, revision = args.revision, use_fast = False)
@@ -279,20 +308,32 @@ def load_tokenizer(args):
 
 
 def load_model(args):
-    # import correct text encoder class
-    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
-
+    tokenizer = load_tokenizer(args)
     # Load scheduler and models
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder = "scheduler")
+    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
     text_encoder = text_encoder_cls.from_pretrained(
         args.pretrained_model_name_or_path, subfolder = "text_encoder", revision = args.revision
     )
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder = "vae", revision = args.revision)
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder = "unet", revision = args.revision,
     )
+    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder = "vae", revision = args.revision)
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder = "scheduler")
 
-    return noise_scheduler, text_encoder_cls, text_encoder, vae, unet
+    return TrainContext(unet, tokenizer, text_encoder, vae, noise_scheduler)
+
+
+def load_dev_model(args):
+    # make small random compatible models for development
+
+    from transformers import CLIPTextConfig
+    unet = UNet2DConditionModel(block_out_channels = (4, 4, 4, 4), cross_attention_dim = 16, norm_num_groups = 4, attention_head_dim = 1)
+    tokenizer = load_tokenizer(args)
+    text_encoder = CLIPTextModel(CLIPTextConfig(hidden_size = 16, intermediate_size = 16))
+    vae = AutoencoderKL(block_out_channels = (4,), norm_num_groups = 1)
+    noise_scheduler = DDPMScheduler()
+
+    return TrainContext(unet, tokenizer, text_encoder, vae, noise_scheduler)
 
 
 def _base_otf_reg(batch, org, weight_dtype, offset_noise, Timer = contextlib.nullcontext):
@@ -342,7 +383,10 @@ def _auto_load_hook(model, accelerator, label):
     model.register_forward_hook(_fwd)
 
 
-def init(args, accelerator, text_encoder, text_encoder_cls, unet):
+def init(ctx: TrainContext):
+    args, accelerator = ctx.args, ctx.accelerator
+    unet, text_encoder = ctx.unet, ctx.text_encoder
+
     if args.report_to == "wandb":
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
@@ -369,7 +413,7 @@ def init(args, accelerator, text_encoder, text_encoder_cls, unet):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             for model in models:
-                sub_dir = "unet" if type(model) == type(unet) else "text_encoder"
+                sub_dir = "unet" if type(model) == type(models.unet) else "text_encoder"
                 model.save_pretrained(os.path.join(output_dir, sub_dir))
 
                 # make sure to pop weight so that corresponding model is not saved again
@@ -380,9 +424,9 @@ def init(args, accelerator, text_encoder, text_encoder_cls, unet):
                 # pop models so that they are not loaded again
                 model = models.pop()
 
-                if type(model) == type(text_encoder):
+                if type(model) == type(models.text_encoder):
                     # load transformers style into model
-                    load_model = text_encoder_cls.from_pretrained(input_dir, subfolder = "text_encoder")
+                    load_model = type(model).from_pretrained(input_dir, subfolder = "text_encoder")
                     model.config = load_model.config
                 else:
                     # load diffusers style into model
@@ -435,10 +479,22 @@ def init(args, accelerator, text_encoder, text_encoder_cls, unet):
             f" {low_precision_error_string}"
         )
 
+    # Enable TF32 for faster training on Ampere GPUs,
+    # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+    if args.allow_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
 
-def make_dataloaders(args, tokenizer, with_prior_preservation, img_batch_size, reg_batch_size):
+    if args.scale_lr:
+        args.learning_rate = args.learning_rate * args.gradient_accumulation_steps * batch_size * accelerator.num_processes
+
+
+def make_dataloaders(args, tokenizer, with_prior_preservation, img_batch_size, reg_batch_size, with_dep = False):
     # col = timed_wrapper()(collate_fn)
-    col = collate_fn
+
+    if with_dep:
+        col = lambda *args, **kwargs: (collate_fn(*args, **kwargs), None)
+    else:
+        col = collate_fn
 
     # Dataset and DataLoaders creation:
     train_dataset = DreamBoothDataset(
@@ -447,7 +503,7 @@ def make_dataloaders(args, tokenizer, with_prior_preservation, img_batch_size, r
         tokenizer = tokenizer,
     )
 
-    train_dataloader = torch.utils.data.DataLoader(
+    train_dataloader = DataLoader(
         TransformedDataset(train_dataset, transforms_random_crop(args.resolution)),
         batch_size = img_batch_size,
         shuffle = True,
@@ -455,7 +511,7 @@ def make_dataloaders(args, tokenizer, with_prior_preservation, img_batch_size, r
         num_workers = args.dataloader_num_workers,
     )
 
-    train_reg_dataset = None
+    train_reg_dataloader = None
     if with_prior_preservation:
         train_reg_dataset = DreamBoothDataset(
             instance_data_root = args.class_data_dir,
@@ -463,17 +519,223 @@ def make_dataloaders(args, tokenizer, with_prior_preservation, img_batch_size, r
             tokenizer = tokenizer,
         )
 
-        train_reg_dataloader = torch.utils.data.DataLoader(
+        train_reg_dataloader = DataLoader(
             TransformedDataset(train_reg_dataset, transforms_random_crop(args.resolution)),
             batch_size = reg_batch_size,
             shuffle = True,
             collate_fn = col,
             num_workers = args.dataloader_num_workers,
         )
-    else:
-        train_reg_dataloader = itertools.cycle([None])
 
     return train_dataloader, train_reg_dataloader
+
+
+class DevModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(3, 3, 1)
+
+    def __call__(self, x):
+        return self.conv(x)
+
+
+class Trainer(Callback):
+    name = "TrainCb"
+    run_valid = False
+    order = 0
+    learn: Learner
+
+    def __init__(self, ctx: TrainContext):
+        super().__init__()
+        self.backward_queue = []
+        self.ctx = ctx
+
+    def after_create(self):
+        assert not hasattr(self.learn, "ctx")
+        self.learn.ctx = self.ctx
+
+    def before_fit(self):
+        if self.ctx.step is None:
+            self.ctx.step = 0
+
+    def before_batch(self):
+        self.ctx.step += 1
+        batch = self.learn.xb[0]
+
+        pixels = batch.pop("pixel_values")
+        latents = self.ctx.vae.encode(pixels.to(dtype = self.ctx.vae.dtype)).latent_dist.sample()
+        latents = latents * self.ctx.vae.config.scaling_factor
+        batch["latents"] = latents.to(self.ctx.accelerator.device)
+
+        # Sample noise that we'll add to the latents
+        if self.args.offset_noise:
+            noise = batch["noise"] = torch.randn_like(latents) + 0.1 * torch.randn(
+                latents.shape[0], latents.shape[1], 1, 1, device = latents.device
+            )
+        else:
+            noise = batch["noise"] = torch.randn_like(latents)
+        batch["encoded_text"] = self.ctx.encode_text(batch["input_ids"]).last_hidden_state
+
+        # Sample a random timestep for each image
+        timesteps = torch.randint(0, self.ctx.noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device = latents.device)
+        batch["timesteps"] = timesteps.long()
+
+        noise_scheduler = self.ctx.noise_scheduler
+        # Get the target for loss depending on the prediction type
+        if noise_scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif noise_scheduler.config.prediction_type == "v_prediction":
+            target = noise_scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+        self.learn.yb = (target,)
+
+    def before_backward(self):
+        # Need to patch backward to call  self.accelerator.backward() for gradient syncing.
+        # Track if the patched backward was called to prevent bugs.
+        assert not self.backward_queue
+        obj = object()
+
+        accelerator = self.ctx.accelerator
+
+        def bw():
+            self.backward_queue.remove(obj)
+            with accelerator.accumulate(self.model):
+                accelerator.backward(self.learn.loss_grad)
+
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+
+        self.backward_queue.append(obj)
+        self.learn.loss_grad.backward = bw
+
+    def before_step(self):
+        # make sure patched bw was called, just to prevent bugs
+        assert not self.backward_queue
+
+    def after_batch(self):
+        ctx = self.ctx
+        args, step, accelerator = ctx.args, ctx.step, ctx.accelerator
+
+        if accelerator.is_main_process:
+            if step % args.checkpointing_steps == 0:
+                save_path = os.path.join(args.output_dir, f"checkpoint-{step}")
+                accelerator.save_state(save_path)
+                logger.info(f"Saved state to {save_path}")
+
+            if args.validation_prompt is not None and step % args.validation_steps == 0:
+                with Timed("Validation images"):
+                    log_validation(ctx.text_encoder, ctx.tokenizer, ctx.unet, ctx.vae, args, accelerator, self.learn.epoch)
+
+    def loss(self, pred, yb):
+        if pred is None:
+            # validation loss, skipped since using log_validate from diffusers code
+            assert not self.learn.training
+            return torch.tensor([1337.0])
+
+        return F.mse_loss(pred, yb, reduction = "mean")
+
+
+class RegBatchImages(Callback):
+    # Adds N prior preservation images to each batch.
+    # Could just do that via main dataloader but since the other prior prev ones make
+    # more sense this way just do it for this one via Callback as well.
+
+    name = "PriorRegCb"
+    run_valid = False
+    learn: Learner
+    order = -1
+
+    def __init__(self, reg_dl: DataLoader, img_batch_size: int, reg_batchsize: int, prior_loss_weight: float):
+        super().__init__()
+        self.reg_dl = reg_dl
+        self.reg_dl_cycle = itertools.cycle(self.reg_dl)
+        self.img_batch_size = img_batch_size
+        self.reg_batchsize = reg_batchsize
+        self.prior_loss_weight = prior_loss_weight
+
+    def before_batch(self):
+        batch = self.learn.xb[0]
+        reg = next(self.reg_dl_cycle)[0]
+
+        assert reg["pixel_values"].shape[0] == reg["input_ids"].shape[0]
+        assert reg["pixel_values"].shape[0] == self.reg_batchsize
+
+        # cat reg batch on top of normal batch
+        batch["pixel_values"] = torch.cat((batch["pixel_values"], reg["pixel_values"].to(batch["pixel_values"].device)))
+        batch["input_ids"] = torch.cat((batch["input_ids"], reg["input_ids"].to(batch["input_ids"].device)))
+
+    def loss(self, pred, yb):
+        if pred is None:
+            # validation loss, skipped since using log_validate from diffusers code
+            assert not self.learn.training
+            return torch.tensor([1337.0])
+
+        model_pred = pred[:self.img_batch_size]
+        model_pred_prior = pred[self.img_batch_size:]
+        target = yb[:self.img_batch_size]
+        target_prior = yb[self.img_batch_size:]
+
+        assert model_pred.shape[0] == self.img_batch_size
+        assert model_pred_prior.shape[0] == self.reg_batchsize
+        assert target.shape[0] == self.img_batch_size
+        assert target_prior.shape[0] == self.reg_batchsize
+
+        # Compute instance loss
+        loss = F.mse_loss(model_pred.float(), target.float(), reduction = "mean")
+
+        # Compute prior loss
+        prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction = "mean")
+        prior_loss_adj = prior_loss * self.prior_loss_weight
+        print("prior_loss {} * {} = {} ".format(prior_loss.item(), self.prior_loss_weight, prior_loss_adj.item()))
+
+        # Add the prior loss to the instance loss.
+        loss = loss + prior_loss_adj
+        self.learn.ctx.accelerator.log({
+            "loss":            loss.item(),
+            "prior_loss":      prior_loss.item(),
+            "prior_loss_adj":  prior_loss_adj.item(),
+            "loss_prio_ratio": (loss / prior_loss).item(),
+        }, step = self.learn.ctx.step)
+
+        return F.mse_loss(pred, yb, reduction = "mean")
+
+
+class Model(torch.nn.Module):
+    def __init__(self, models: TrainContext, args):
+        super().__init__()
+        self.models = m = models
+        self.args = args
+        self.learn = None
+
+        self.unet = m.unet
+        if args.train_text_encoder:
+            # so it's part of parameters() when trained too
+            self.text_encoder = m.text_encoder
+
+    def __call__(self, batch):
+        if not self.training and batch is None:
+            return None
+
+        m = self.models
+        vae, noise_scheduler = m.vae, m.noise_scheduler
+
+        latents = batch["latents"]
+        noise = batch["noise"]
+        timesteps = batch["timesteps"]
+        encoder_hidden_states = batch["encoded_text"]
+
+        # Add noise to the latents according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+        # Get the text embedding for conditioning
+        # Predict the noise residual
+        assert encoder_hidden_states.shape[0] == noisy_latents.shape[0]
+        model_pred = m.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+        return model_pred
 
 
 def main(args):
@@ -526,48 +788,52 @@ def main(args):
                 create_class_images(args, accelerator, num_new_images, class_images_dir, cur_class_images)
                 raise ValueError()
 
-    tokenizer = load_tokenizer(args)
-    train_dataloader, train_reg_dataloader = make_dataloaders(args, tokenizer, with_prior_preservation, img_batch_size, reg_batch_size)
-
     with Timed("Model Load", True):
-        noise_scheduler, text_encoder_cls, text_encoder, vae, unet = load_model(args)
-        vae.requires_grad_(False)
+        ctx = load_model(args) if not IS_DEV else load_dev_model(args)
+        ctx.set_cached(not args.train_text_encoder)
+        ctx.vae.requires_grad_(False)
+        ctx.text_encoder.requires_grad_(bool(args.train_text_encoder))
+        ctx.args = args
+        ctx.accelerator = accelerator
+        train_dataloader, train_reg_dataloader = make_dataloaders(args, ctx.tokenizer, with_prior_preservation, img_batch_size, reg_batch_size, True)
 
-    init(args, accelerator, text_encoder, text_encoder_cls, unet)
+    init(ctx)
 
-    encode_text_stats = None
+    # Prepare everything with our `accelerator`.
+    ctx.unet, ctx.vae = accelerator.prepare(ctx.unet, ctx.vae)
+    train_dataloader, train_reg_dataloader = accelerator.prepare(train_dataloader, train_reg_dataloader)
     if args.train_text_encoder:
-        encode_text = text_encoder
-        text_encoder.requires_grad_(False)
-    else:
-        # cache CLIP encodes when not training text encoder
-        encode_text, encode_text_stats = _make_cached_caller_targ(text_encoder)
+        ctx.text_encoder = accelerator.prepare(ctx.text_encoder)
 
-    # Enable TF32 for faster training on Ampere GPUs,
-    # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
-    if args.allow_tf32:
-        torch.backends.cuda.matmul.allow_tf32 = True
+    # Move vae and text_encoder to device and cast to weight_dtype
+    ctx.vae.to(accelerator.device, dtype = weight_dtype)
+    if not args.train_text_encoder:
+        ctx.text_encoder.to(accelerator.device, dtype = weight_dtype)
 
-    if args.scale_lr:
-        args.learning_rate = args.learning_rate * args.gradient_accumulation_steps * batch_size * accelerator.num_processes
+    # Scheduler and math around the number of training steps.
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
 
-    # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
-    if args.use_8bit_adam:
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError("To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`.")
-        optimizer_class = bnb.optim.AdamW8bit
-    else:
-        optimizer_class = torch.optim.AdamW
-        if IS_DEV:
-            optimizer_class = lambda *args, betas = None, weight_decay = None, eps = None, **kwargs: torch.optim.SGD(*args, **kwargs)
+    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if overrode_max_train_steps:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    # Afterwards we recalculate our number of training epochs
+    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-    make_reg = None
+    # Train!
+    total_batch_size = batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+
+    callbacks = []
     if args.prior_preservation_mode == "image":
-        # make_reg = lambda *args: args[1:]
-        pass
-    elif args.prior_preservation_mode in ("base_img_otf", "base_img_preinit"):
+        assert train_reg_dataloader is not None
+        callbacks.append(RegBatchImages(train_reg_dataloader, img_batch_size, reg_batch_size, args.prior_loss_weight))
+    # if args.prior_preservation_mode == "base_img_otf":
+    #     callbacks.append(RegBatchImages(train_reg_dataloader, img_batch_size, reg_batch_size, args.prior_loss_weight))
+    elif args.prior_preservation_mode in []: #("base_img_otf", "base_img_preinit"):
         if args.prior_preservation_base_otf_half:
             c = lambda md: accelerator.prepare(copy.deepcopy(md).requires_grad_(False).half())
         else:
@@ -630,59 +896,6 @@ def main(args):
     elif args.prior_preservation_mode is not None:
         raise ValueError("unsupported prior_preservation_mode", args.prior_preservation_mode)
 
-    # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
-
-    # Optimizer creation
-    params_to_optimize = (
-        itertools.chain(unet.parameters(), text_encoder.parameters()) if args.train_text_encoder else unet.parameters()
-    )
-    optimizer = optimizer_class(
-        params_to_optimize,
-        lr = args.learning_rate,
-        betas = (args.adam_beta1, args.adam_beta2),
-        weight_decay = args.adam_weight_decay,
-        eps = args.adam_epsilon,
-    )
-
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler,
-        optimizer = optimizer,
-        num_warmup_steps = args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps = args.max_train_steps * args.gradient_accumulation_steps,
-        num_cycles = args.lr_num_cycles,
-        power = args.lr_power,
-    )
-
-    # Prepare everything with our `accelerator`.
-    if args.train_text_encoder:
-        unet, text_encoder, optimizer, train_dataloader, train_reg_dataloader, lr_scheduler = accelerator.prepare(
-            unet, text_encoder, optimizer, train_dataloader, train_reg_dataloader, lr_scheduler
-        )
-    else:
-        unet, optimizer, train_dataloader, train_reg_dataloader, lr_scheduler = accelerator.prepare(
-            unet, optimizer, train_dataloader, train_reg_dataloader, lr_scheduler
-        )
-
-    # Move vae and text_encoder to device and cast to weight_dtype
-    vae.to(accelerator.device, dtype = weight_dtype)
-    if not args.train_text_encoder:
-        text_encoder.to(accelerator.device, dtype = weight_dtype)
-
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    # Train!
-    total_batch_size = batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
     with Timer("accelerator.init_trackers took {} secs"):
         # We need to initialize the trackers we use, and also store our configuration.
         # The trackers initializes automatically on the main process.
@@ -697,7 +910,7 @@ def main(args):
     logger.info("***** Running training *****")
     logger.info(f"  is_main_process = {accelerator.is_main_process}")
     logger.info(f"  Num examples = {len(train_dataloader.dataset)}")
-    logger.info(f"  Num reg examples = {len(train_reg_dataloader.dataset)}")
+    logger.info(f"  Num reg examples = {len(train_reg_dataloader.dataset) if train_reg_dataloader else None}")
     logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {batch_size} ({img_batch_size} img + {reg_batch_size} reg)")
@@ -707,39 +920,40 @@ def main(args):
     global_step = 0
     first_epoch = 0
 
-    # Potentially load in the weights and states from a previous save
-    resume_step = None
-    if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
-        else:
-            # Get the mos recent checkpoint
-            dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key = lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
-
-        if path is None:
-            accelerator.print(
-                f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
-            )
-            args.resume_from_checkpoint = None
-        else:
-            accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
-            global_step = int(path.split("-")[1])
-
-            resume_global_step = global_step * args.gradient_accumulation_steps
-            first_epoch = global_step // num_update_steps_per_epoch
-            resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
+    # TODO:
+    # # Potentially load in the weights and states from a previous save
+    # resume_step = None
+    # if args.resume_from_checkpoint:
+    #     if args.resume_from_checkpoint != "latest":
+    #         path = os.path.basename(args.resume_from_checkpoint)
+    #     else:
+    #         # Get the mos recent checkpoint
+    #         dirs = os.listdir(args.output_dir)
+    #         dirs = [d for d in dirs if d.startswith("checkpoint")]
+    #         dirs = sorted(dirs, key = lambda x: int(x.split("-")[1]))
+    #         path = dirs[-1] if len(dirs) > 0 else None
+    #
+    #     if path is None:
+    #         accelerator.print(
+    #             f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
+    #         )
+    #         args.resume_from_checkpoint = None
+    #     else:
+    #         accelerator.print(f"Resuming from checkpoint {path}")
+    #         accelerator.load_state(os.path.join(args.output_dir, path))
+    #         global_step = int(path.split("-")[1])
+    #
+    #         resume_global_step = global_step * args.gradient_accumulation_steps
+    #         first_epoch = global_step // num_update_steps_per_epoch
+    #         resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
 
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable = not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
     if IS_DEV:
-        unet.set_attention_slice(1)
-        unet.set_attn_processor
+        ctx.unet.set_attention_slice(1)
+        ctx.unet.set_attn_processor
 
         def enc(model, org_fn, *args, **kwargs):
             with Timer("VAE TO Device took {}"):
@@ -749,176 +963,83 @@ def main(args):
                 model.to("cpu")
             return res
 
-        vae.encode = partial(enc, vae, vae.encode)
+        ctx.vae.encode = partial(enc, ctx.vae, ctx.vae.encode)
 
-    train_reg_dataloader_cycle = itertools.cycle(train_reg_dataloader)
-
+    # train_reg_dataloader_cycle = itertools.cycle(train_reg_dataloader)
     # if IS_DEV:
     #     log_validation(text_encoder, tokenizer, unet, vae, args, accelerator, weight_dtype, 0)
 
-    MiniTimer = Timer
-    MiniTimer = contextlib.nullcontext
-
-    print("starting", os.getpid())
-    for epoch in range(first_epoch, args.num_train_epochs):
-        epoch_timer = Timed("EPOCH")
-        epoch_timer.__enter__()
-
-        unet.train()
-        if args.train_text_encoder:
-            text_encoder.train()
-
-        if args.prior_preservation_mode == "base_img_preinit":
-            steps_needed = len(train_dataloader.dataset) - (resume_step or 0)
-            base_img_preinit_warmup(steps_needed, train_reg_dataloader_cycle, True)
-            req_iter = itertools.cycle([None])
+    # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
+    def make_optimizer():
+        if args.use_8bit_adam:
+            try:
+                import bitsandbytes as bnb
+            except ImportError:
+                raise ImportError("To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`.")
+            optimizer_class = bnb.optim.AdamW8bit
         else:
-            req_iter = train_reg_dataloader_cycle
+            optimizer_class = torch.optim.AdamW
 
-        for step, (batch, reg_batch) in enumerate(zip(train_dataloader, req_iter)):
-            # Skip steps until we reach the resumed step
-            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
-                if step % args.gradient_accumulation_steps == 0:
-                    progress_bar.update(1)
-                continue
+        if IS_DEV:
+            optimizer_class = lambda *args, betas = None, weight_decay = None, eps = None, **kwargs: torch.optim.SGD(*args, **kwargs)
 
-            with accelerator.accumulate(unet):
-                # Convert images to latent space
-                pixels = batch["pixel_values"]
-                if reg_batch and "pixel_values" in reg_batch:
-                    pixels = torch.cat((pixels, reg_batch["pixel_values"]))
-                with MiniTimer("VAE encode of %s images took {}" % (pixels.shape,)):
-                    latents = vae.encode(pixels.to(dtype = weight_dtype)).latent_dist.sample()
-                    del pixels
-                latents = latents * vae.config.scaling_factor
+        opt_args = partial(
+            optimizer_class,
+            betas = (args.adam_beta1, args.adam_beta2),
+            weight_decay = args.adam_weight_decay,
+            eps = args.adam_epsilon,
+        )
+        return partial(OptimWrapper, opt = opt_args)
 
-                # Sample noise that we'll add to the latents
-                if args.offset_noise:
-                    noise = torch.randn_like(latents) + 0.1 * torch.randn(
-                        latents.shape[0], latents.shape[1], 1, 1, device = latents.device
-                    )
-                else:
-                    noise = torch.randn_like(latents)
+    optim = make_optimizer()
 
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device = latents.device)
-                timesteps = timesteps.long()
+    with_prior_preservation = args.prior_preservation_mode
+    img_batch_size = args.train_batch_size
+    reg_batch_size = (img_batch_size * args.regs_per_image) if with_prior_preservation else 0
+    batch_size = img_batch_size + reg_batch_size
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+    model = Model(ctx, args)
+    ctx.model = model
 
-                # Get the text embedding for conditioning
-                input_ids = batch["input_ids"]
-                if reg_batch and "input_ids" in reg_batch:
-                    input_ids = torch.cat((input_ids, reg_batch["input_ids"]))
+    val_dataset = StaticDataset([(None, None)])
+    dls = DataLoaders(train_dataloader, val_dataset)
+    trainercb = Trainer(ctx)
 
-                with MiniTimer("CLIP of batch %s took {}" % (input_ids.shape,)):
-                    encoder_hidden_states = encode_text(input_ids).last_hidden_state
-                    del input_ids
+    loss_fn = trainercb.loss
+    if callbacks:
+        with_loss = [i for i in callbacks if hasattr(i, "loss")]
+        if with_loss:
+            assert len(with_loss) == 1
+            loss_fn = with_loss[0].loss
+            print("using cb loss function", loss_fn)
 
-                reg_target = None
-                if make_reg is not None:
-                    with torch.no_grad():
-                        noisy_latents, timesteps, encoder_hidden_states, reg_target = \
-                            make_reg(reg_batch, noisy_latents, timesteps, encoder_hidden_states)
+    learner = Learner(dls, model, loss_fn, optim, args.learning_rate, cbs = [trainercb] + callbacks)
+    ctx.unet.train()
+    if args.train_text_encoder:
+        ctx.text_encoder.train()
+    learner.fit(1)
 
-                with MiniTimer("Unet of %s latents took {}" % (noisy_latents.shape,)):
-                    # Predict the noise residual
-                    assert encoder_hidden_states.shape[0] == noisy_latents.shape[0]
-                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-                if with_prior_preservation:
-                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
-                    model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim = 0)
-                    if reg_target is not None:
-                        target_prior = reg_target
-                    else:
-                        target, target_prior = torch.chunk(target, 2, dim = 0)
-
-                    # Compute instance loss
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction = "mean")
-
-                    # Compute prior loss
-                    prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction = "mean")
-                    prior_loss_adj = prior_loss * args.prior_loss_weight
-                    print("prior_loss {} * {} = {} ".format(prior_loss.item(), args.prior_loss_weight, prior_loss_adj.item()))
-
-                    # Add the prior loss to the instance loss.
-                    loss = loss + prior_loss_adj
-                    accelerator.log({
-                        "loss":            loss.item(),
-                        "prior_loss":      prior_loss.item(),
-                        "prior_loss_adj":  prior_loss_adj.item(),
-                        "loss_prio_ratio": (loss / prior_loss).item(),
-                        "epoch":           epoch,
-                    }, step = step)
-                else:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction = "mean")
-                    accelerator.log({ "loss": loss.item(), "epoch": epoch }, step = step)
-
-                with MiniTimer("backward took {}"):
-                    accelerator.backward(loss)
-
-                if accelerator.sync_gradients:
-                    with MiniTimer("sync_gradients 1 took {}"):
-                        params_to_clip = (
-                            itertools.chain(unet.parameters(), text_encoder.parameters())
-                            if args.train_text_encoder
-                            else unet.parameters()
-                        )
-                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-
-                with MiniTimer("Opt Steps took {}"):
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none = args.set_grads_to_none)
-
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                global_step += 1
-
-                if accelerator.is_main_process:
-                    if global_step % args.checkpointing_steps == 0:
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
-
-                    if args.validation_prompt is not None and global_step % args.validation_steps == 0:
-                        with Timed("Validation images"):
-                            log_validation(text_encoder, tokenizer, unet, vae, args, accelerator, weight_dtype, epoch)
-
-            logs = { "loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0] }
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step = global_step)
-
-            if global_step >= args.max_train_steps:
-                break
-
-        epoch_timer.__exit__(None, None, None)
+    print("models.encode_text_stats", ctx.encode_text_stats)
+    accelerator.log({ "encode_text_stats": ctx.encode_text_stats })
 
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         pipeline = DiffusionPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
-            unet = accelerator.unwrap_model(unet),
-            text_encoder = accelerator.unwrap_model(text_encoder),
+            unet = accelerator.unwrap_model(ctx.unet),
+            text_encoder = accelerator.unwrap_model(ctx.text_encoder),
             revision = args.revision,
         )
         pipeline.save_pretrained(args.output_dir)
         pipeline.enable_attention_slicing()
 
     accelerator.end_training()
+
+    # logs = { "loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0] }
+    # progress_bar.set_postfix(**logs)
+    # accelerator.log(logs, step = global_step)
+    return
 
 
 if __name__ == "__main__":

@@ -14,29 +14,35 @@ class Timed:
     def __init__(self, label: str, seperator_lines: bool = False):
         self.label = label
         self.seperator_lines = seperator_lines
-        self.start = self.end = self.secs = None
+        self.start_ts = self.end_ts = self.secs = None
+
+    def reset(self):
+        self.start_ts = None
+        self.end_ts = None
+        self.secs = None
 
     def start(self):
         if self.seperator_lines:
             print("=" * 100)
         print(f"TIMED START: {self.label!r}")
-        self.start = time.monotonic()
+        self.start_ts = time.monotonic()
         return self
 
     def end(self):
-        self.end = time.monotonic()
-        self.secs = self.end - self.start
+        self.end_ts = time.monotonic()
+        self.secs = self.end_ts - self.start_ts
         print(f"TIMED DONE : {self.label!r} took {self.secs:.3f} seconds")
         if self.seperator_lines:
             print("=" * 100)
 
         return self.secs
 
+
     def __enter__(self):
         return self.start()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        return self.end()
+        self.end()
 
 
 class Timer():

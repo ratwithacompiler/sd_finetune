@@ -16,6 +16,17 @@ def _dir_files_cleaned(dir: Path, sort = True):
     return files
 
 
+class StaticDataset(Dataset):
+    def __init__(self, items):
+        self.items = list(items)
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        return self.items[idx]
+
+
 class DreamBoothDataset(Dataset):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.

@@ -58,6 +58,7 @@ def parse_args(input_args = None):
 
     parser.add_argument(
         "--prior_preservation_mode",
+        default = "off",
         choices = ["image", "base_img_otf", "base_img_preinit", "off"],
         help = "Enable type of prior preservation loss.",
     )
