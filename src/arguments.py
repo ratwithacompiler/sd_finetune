@@ -115,7 +115,7 @@ def parse_args(input_args = None):
         "--train_batch_size", type = int, default = 4, help = "Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
-        "--regs_per_image", type = int, default = 1, help = "Number of regularization images adder per image into each batch."
+        "--reg_batch_size", type = int, default = 1, help = "Number of regularization images used per batch."
     )
 
     parser.add_argument(
@@ -276,7 +276,7 @@ def parse_args(input_args = None):
     parser.add_argument(
         "--validation_batch_size",
         type = int,
-        default = 100,
+        default = 2,
         help = (
             "batch size for creating validation images"
         ),
