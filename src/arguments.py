@@ -274,6 +274,11 @@ def parse_args(input_args = None):
         ),
     )
     parser.add_argument(
+        "--validation_clean",
+        action = "store_true",
+        help = ("reduce memory before validation run"),
+    )
+    parser.add_argument(
         "--validation_batch_size",
         type = int,
         default = 2,

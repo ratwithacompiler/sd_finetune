@@ -16,22 +16,22 @@
 """
 Features:
 
-
-
-
 """
+
+import os
+import torch
+
+IS_DEV = os.environ.get("DEV") == "1"
+# if os.getenv("SKIP_IMPORTS") != "1":
 import contextlib
-import copy
 import hashlib
 import itertools
 import logging
 import math
 import os
-import queue
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import accelerate
@@ -53,15 +53,9 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig, CLIPTextModel
 
 import diffusers
-from diffusers import (
-    AutoencoderKL,
-    DDPMScheduler,
-    DiffusionPipeline,
-    DPMSolverMultistepScheduler,
-    UNet2DConditionModel, StableDiffusionPipeline,
-)
-from diffusers.optimization import get_scheduler
-from diffusers.utils import check_min_version, is_wandb_available
+from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, DPMSolverMultistepScheduler, UNet2DConditionModel, StableDiffusionPipeline
+
+from diffusers.utils import is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
 from arguments import parse_args
@@ -69,13 +63,11 @@ from dataload import PromptDataset, DreamBoothDataset, TransformedDataset, trans
 from utils import Timer, Timed, timed_wrapper, _make_cached_caller_targ
 
 from fastai.callback.core import Callback
-from fastai.learner import Learner, Recorder
+from fastai.learner import Learner
 from fastai.data.core import DataLoaders
 
-IS_DEV = os.environ.get("DEV") == "1"
-
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.15.0")
+diffusers.utils.check_min_version("0.15.0")
 
 logger = get_logger(__name__)
 
@@ -338,38 +330,38 @@ def load_dev_model(args):
     return TrainContext(unet, tokenizer, text_encoder, vae, noise_scheduler)
 
 
-def _base_otf_reg(batch, org, weight_dtype, offset_noise, Timer = contextlib.nullcontext):
-    org_dtype = org.vae.dtype
-    pixels = batch["pixel_values"]
-    with Timer("VAE encode of %s images took {}" % (pixels.shape,)):
-        latents = org.vae.encode(pixels.to(dtype = org_dtype)).latent_dist.sample()
-        del pixels
-    latents = latents * org.vae.config.scaling_factor
-
-    if offset_noise:
-        noise = torch.randn_like(latents) + 0.1 * torch.randn(
-            latents.shape[0], latents.shape[1], 1, 1, device = latents.device
-        )
-    else:
-        noise = torch.randn_like(latents)
-
-    timesteps = torch.randint(0, org.noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device = latents.device)
-    timesteps = timesteps.long()
-
-    noisy_latents = org.noise_scheduler.add_noise(latents, noise.to(org_dtype), timesteps)
-
-    input_ids = batch["input_ids"]
-    with Timer("ORG CLIP of batch %s took {}" % (input_ids.shape,)):
-        encoder_hidden_states = org.encode_text_fn(input_ids).last_hidden_state.to(org_dtype)
-        del input_ids
-
-    with Timer("ORG Unet of %s latents took {}" % (latents.shape,)):
-        # Predict the noise residual
-        assert encoder_hidden_states.shape[0] == noisy_latents.shape[0]
-        model_pred = org.unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
-    [i.to(weight_dtype) for i in (noisy_latents, encoder_hidden_states, model_pred)]
-    return noisy_latents, timesteps, encoder_hidden_states, model_pred
+# def _base_otf_reg(batch, org, weight_dtype, offset_noise, Timer = contextlib.nullcontext):
+#     org_dtype = org.vae.dtype
+#     pixels = batch["pixel_values"]
+#     with Timer("VAE encode of %s images took {}" % (pixels.shape,)):
+#         latents = org.vae.encode(pixels.to(dtype = org_dtype)).latent_dist.sample()
+#         del pixels
+#     latents = latents * org.vae.config.scaling_factor
+#
+#     if offset_noise:
+#         noise = torch.randn_like(latents) + 0.1 * torch.randn(
+#             latents.shape[0], latents.shape[1], 1, 1, device = latents.device
+#         )
+#     else:
+#         noise = torch.randn_like(latents)
+#
+#     timesteps = torch.randint(0, org.noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device = latents.device)
+#     timesteps = timesteps.long()
+#
+#     noisy_latents = org.noise_scheduler.add_noise(latents, noise.to(org_dtype), timesteps)
+#
+#     input_ids = batch["input_ids"]
+#     with Timer("ORG CLIP of batch %s took {}" % (input_ids.shape,)):
+#         encoder_hidden_states = org.encode_text_fn(input_ids).last_hidden_state.to(org_dtype)
+#         del input_ids
+#
+#     with Timer("ORG Unet of %s latents took {}" % (latents.shape,)):
+#         # Predict the noise residual
+#         assert encoder_hidden_states.shape[0] == noisy_latents.shape[0]
+#         model_pred = org.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+#
+#     [i.to(weight_dtype) for i in (noisy_latents, encoder_hidden_states, model_pred)]
+#     return noisy_latents, timesteps, encoder_hidden_states, model_pred
 
 
 def _auto_load_hook(model, accelerator, label):
@@ -561,6 +553,7 @@ class Trainer(Callback):
         batch = self.learn.xb[0]
 
         pixels = batch.pop("pixel_values")
+        print("pixels", pixels.shape)
         latents = self.ctx.vae.encode(pixels.to(dtype = self.ctx.vae.dtype)).latent_dist.sample()
         latents = latents.to(self.ctx.unet.dtype) * self.ctx.vae.config.scaling_factor
         batch["latents"] = latents.to(self.ctx.accelerator.device)
@@ -572,7 +565,10 @@ class Trainer(Callback):
             )
         else:
             noise = batch["noise"] = torch.randn_like(latents)
-        batch["encoded_text"] = self.ctx.encode_text(batch["input_ids"]).last_hidden_state
+
+        context = not contextlib if self.ctx.args.train_text_encoder else torch.no_grad()
+        with context:
+            batch["encoded_text"] = self.ctx.encode_text(batch["input_ids"]).last_hidden_state
 
         # Sample a random timestep for each image
         timesteps = torch.randint(0, self.ctx.noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device = latents.device)
@@ -592,6 +588,7 @@ class Trainer(Callback):
     def before_backward(self):
         # Need to patch backward to call  self.accelerator.backward() for gradient syncing.
         # Track if the patched backward was called to prevent bugs.
+        # TODO: raise CancelBackwardEx and just do .backward() here
         assert not self.backward_queue
         obj = object()
 
@@ -719,7 +716,7 @@ class RegBatchImages(Callback):
 
 
 class Model(torch.nn.Module):
-    def __init__(self, ctx: TrainContext):
+    def __init__(self, ctx: TrainContext, add_all = False):
         super().__init__()
         ctx.model = self
         self.ctx = ctx
@@ -727,8 +724,11 @@ class Model(torch.nn.Module):
 
         # assign so they're part of paramters()
         self.unet = ctx.unet
-        if ctx.args.train_text_encoder:
+        if ctx.args.train_text_encoder or add_all:
             self.text_encoder = ctx.text_encoder
+
+        if add_all:
+            self.vae = ctx.vae
 
     def __call__(self, batch):
         if not self.training and batch is None:
@@ -994,31 +994,36 @@ def make_optimizer(args):
     return partial(OptimWrapper, opt = opt_args)
 
 
-def main(args):
+def get_loss_fn(callbacks, default):
+    loss_fn = default
+
+    with_loss = [i for i in (callbacks or []) if hasattr(i, "loss")]
+    if with_loss:
+        assert len(with_loss) == 1, "multiple losses"
+        loss_fn = with_loss[0].loss
+        print("using cb loss function", loss_fn)
+
+    return loss_fn
+
+
+def main(args, run_lr_find: bool = False):
     ctx = setup1(args, devmodel = IS_DEV)
     callbacks = setup2(ctx)
     model = Model(ctx)
 
-    val_dataset = StaticDataset([(None, None)])
+    val_dataset = StaticDataset([(None, None)])  # use the diffusers log_validation() for val
     dls = DataLoaders(ctx.train_dataloader, val_dataset)
 
     trainercb = Trainer(ctx)
     optim = make_optimizer(ctx.args)
+    loss_fn = get_loss_fn(callbacks, trainercb.loss)
 
-    loss_fn = trainercb.loss
-    with_loss = [i for i in (callbacks or []) if hasattr(i, "loss")]
-    if with_loss:
-        assert len(with_loss) == 1
-        loss_fn = with_loss[0].loss
-        print("using cb loss function", loss_fn)
+    if run_lr_find:
+        learn = Learner(dls, model, loss_fn, optim, args.learning_rate, cbs = [trainercb] + callbacks)
+        learn.lr_find()
+        return learn
 
-    # from fastai.callback.schedule import lr_find
-    # from fastai.learner import Recorder
-    # rec = Recorder()
-    # learn = Learner(dls, model, loss_fn, optim, args.learning_rate, cbs = [trainercb, rec] + callbacks)
-    # learn.lr_find()
-    # return
-
+    optim = optim(model.parameters(), lr = args.learning_rate)
     learn = Learner(dls, model, loss_fn, optim, args.learning_rate, cbs = [trainercb] + callbacks)
     ctx.unet.train()
     if args.train_text_encoder:
