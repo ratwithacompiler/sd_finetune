@@ -1,11 +1,14 @@
+import io
+import zipfile
 from pathlib import Path
 
+import torch
 from torch.utils.data import Dataset
 from PIL import Image
 from torchvision import transforms
 
 
-def _dir_files_cleaned(dir: Path, sort = True):
+def dir_files_cleaned(dir: Path, sort = True):
     files = []
     for i in dir.iterdir():
         if i.is_file() and not i.name.startswith("."):
@@ -36,8 +39,8 @@ class DreamBoothDataset(Dataset):
     def __init__(
             self,
             instance_data_root,
-            instance_prompt,
-            tokenizer,
+            instance_prompt = None,
+            tokenizer = None,
     ):
         self.tokenizer = tokenizer
 
@@ -45,7 +48,7 @@ class DreamBoothDataset(Dataset):
         if not self.instance_data_root.exists():
             raise ValueError(f"Instance {self.instance_data_root} images root doesn't exists.")
 
-        self.instance_images_path = _dir_files_cleaned(self.instance_data_root)
+        self.instance_images_path = dir_files_cleaned(self.instance_data_root)
         self.num_instance_images = len(self.instance_images_path)
         self.instance_prompt = instance_prompt
         self._length = self.num_instance_images
@@ -61,13 +64,62 @@ class DreamBoothDataset(Dataset):
 
         # example["instance_images"] = self.image_transforms(instance_image)
         example["instance_images"] = instance_image
-        example["instance_prompt_ids"] = self.tokenizer(
-            self.instance_prompt,
-            truncation = True,
-            padding = "max_length",
-            max_length = self.tokenizer.model_max_length,
-            return_tensors = "pt",
-        ).input_ids
+        if self.instance_prompt is not None:
+            example["instance_prompt_ids"] = self.tokenizer(
+                self.instance_prompt,
+                truncation = True,
+                padding = "max_length",
+                max_length = self.tokenizer.model_max_length,
+                return_tensors = "pt",
+            ).input_ids
+
+        return example
+
+
+class LatentZipDataset(Dataset):
+    """
+    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
+    It pre-processes the images and the tokenizes prompts.
+    """
+
+    def __init__(self, zip_path,
+                 instance_prompt = None,
+                 tokenizer = None,
+                 ):
+        self.tokenizer = tokenizer
+
+        self.zip_path = Path(zip_path)
+        if not self.zip_path.exists():
+            raise ValueError(f"Latents {self.zip_path} zip_path doesn't exists.")
+
+        self.zip_file = zipfile.ZipFile(zip_path, "r")
+        filenames = self.zip_file.namelist()
+        self.filenames = [i for i in filenames if not i.startswith(".")]
+
+        self.num_instance_images = len(self.filenames)
+        self.instance_prompt = instance_prompt
+
+    def __len__(self):
+        return self.num_instance_images
+
+    def __getitem__(self, index):
+        example = { }
+
+        torch_data = self.zip_file.read(self.filenames[index])
+        data = torch.load(io.BytesIO(torch_data), map_location = "cpu")
+        assert data.shape[0] == 4
+        assert len(data.shape) == 3
+        data = data[None]
+        example["latents"] = data
+
+        if self.instance_prompt is not None:
+            example["instance_prompt_ids"] = self.tokenizer(
+                self.instance_prompt,
+                truncation = True,
+                padding = "max_length",
+                max_length = self.tokenizer.model_max_length,
+                return_tensors = "pt",
+            ).input_ids
 
         return example
 

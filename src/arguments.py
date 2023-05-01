@@ -32,15 +32,25 @@ def parse_args(input_args = None):
         "--instance_data_dir",
         type = str,
         default = None,
-        required = True,
+        help = "A folder containing the training data of instance images.",
+    )
+    parser.add_argument(
+        "--instance_latent_zip",
+        type = str,
+        default = None,
         help = "A folder containing the training data of instance images.",
     )
     parser.add_argument(
         "--class_data_dir",
         type = str,
         default = None,
-        required = False,
         help = "A folder containing the training data of class images.",
+    )
+    parser.add_argument(
+        "--class_latent_zip",
+        type = str,
+        default = None,
+        help = "A zip containing the training data of class image latents.",
     )
     parser.add_argument(
         "--instance_prompt",
@@ -121,7 +131,7 @@ def parse_args(input_args = None):
     parser.add_argument(
         "--sample_batch_size", type = int, default = 4, help = "Batch size (per device) for sampling images."
     )
-    parser.add_argument("--num_train_epochs", type = int, default = 500)
+    parser.add_argument("--num_train_epochs", type = int, default = 10)
     parser.add_argument(
         "--max_train_steps",
         type = int,
@@ -274,9 +284,10 @@ def parse_args(input_args = None):
         ),
     )
     parser.add_argument(
-        "--validation_clean",
-        action = "store_true",
-        help = ("reduce memory before validation run"),
+        "--no_validation_clean",
+        action = "store_false",
+        dest = "validation_clean",
+        help = ("dont reduce memory before validation run"),
     )
     parser.add_argument(
         "--validation_batch_size",
@@ -349,9 +360,19 @@ def parse_args(input_args = None):
     if args.prior_preservation_mode.lower() == "off":
         args.prior_preservation_mode = None
 
+    if not args.instance_latent_zip and not args.instance_data_dir:
+        raise ValueError("one of instance_data_dir or instance_latent_zip required")
+
+    if args.instance_latent_zip and args.instance_data_dir:
+        raise ValueError("exactly one of instance_data_dir or instance_latent_zip required, got both")
+
     if args.prior_preservation_mode:
-        if args.class_data_dir is None:
-            raise ValueError("You must specify a data directory for class images.")
+        if not args.class_latent_zip and not args.class_data_dir:
+            raise ValueError("one of class_data_dir or class_latent_zip required")
+
+        if args.class_latent_zip and args.class_data_dir:
+            raise ValueError("exactly one of class_data_dir or class_latent_zip required, got both")
+
         if args.class_prompt is None:
             raise ValueError("You must specify prompt for class images.")
     else:

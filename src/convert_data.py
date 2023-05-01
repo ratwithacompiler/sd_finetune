@@ -5,6 +5,7 @@ import math
 import os
 import sys
 from functools import partial
+from typing import List
 
 import torchvision
 from diffusers import AutoencoderKL
@@ -12,6 +13,8 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from pathlib import Path
+
+from dataload import LatentZipDataset
 
 
 def dir_files_cleaned(dir: Path, sort = True):
@@ -147,7 +150,8 @@ def cycle_n(n, multi_iterable):
             yield i
 
 
-def main(args):
+def main_convert(args):
+    torch.set_grad_enabled(False)
     torch.manual_seed(123)
     if args.device:
         device = torch.device(args.device)
@@ -159,8 +163,6 @@ def main(args):
         args.input_path = "../dev/data2_smol/"
         args.input_path = "../dev/data1"
         args.input_path = "../dev/data2"
-        args.input_path = "/Volumes/alre_r5/train_14/use_src7"
-        # args.input_path = "/Volumes/alre_r5/train_14/use_test"
         args.batch_size = 4
         # size = (512, 512)
         args.size = 64
@@ -232,25 +234,6 @@ def main(args):
         else:
             latents = [None] * bs
 
-        # image = vae.decode(latents).sample
-        # image = (image / 2 + 0.5).clamp(0, 1)
-        # image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
-        # images = (image * 255).round().astype("uint8")
-        # import PIL.Image
-        # pil_images = [PIL.Image.fromarray(image) for image in images]
-        # for pos, i in enumerate(pil_images):
-        #     i.save(f"../dev/test/{pos}.png")
-
-        # print("max", batch.amax((1, 2, 3)))
-        # print("min", batch.amin((1, 2, 3)))
-        # show_images(batch)
-        # show_images((batch / 2 + 0.5).clamp(0, 1))
-        # break
-
-        # assert len(names) == latents.shape[0]
-        # for name, lt in zip(names, latents):
-        #     torch.save(lt, find_filepath(output_path, name, ".pt"))
-
         assert len(names) == bs
         assert len(latents) == bs
         assert len(batch) == bs
@@ -288,26 +271,96 @@ def find_filepath(output_path: Path, name_start: str, ext: str, max_tries = 1024
     raise ValueError("reached max tries, couldnt find filename", output_path, name_start, ext, option, max_tries)
 
 
+def show_collate_fn(examples: List[dict]) -> dict:
+    input_ids = [example["instance_prompt_ids"] for example in examples if "instance_prompt_ids" in example] or None
+    latents = [example["latents"] for example in examples if "latents" in example] or None
+    if latents:
+        latents = torch.cat(latents)
+        latents = latents.to(memory_format = torch.contiguous_format).float()
+
+    if input_ids:
+        input_ids = torch.cat(input_ids, dim = 0)
+
+    batch = {
+        "input_ids": input_ids,
+        "latents":   latents,
+    }
+    return batch
+
+
+def main_show(args):
+    torch.set_grad_enabled(False)
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = 'mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    ds = LatentZipDataset(args.zip_path)
+    train_dataloader = DataLoader(
+        ds,
+        batch_size = args.batch_size,
+        shuffle = True,
+        collate_fn = show_collate_fn,
+    )
+
+    vae = AutoencoderKL.from_pretrained(args.vae_name_or_path, subfolder = "vae")
+    vae = vae.to(device)
+
+    for batch in train_dataloader:
+        latents = batch["latents"]
+        image = vae.decode(latents.to(device))
+        image = image.sample
+
+        # image = (image / 2 + 0.5).clamp(0, 1)
+        # image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+        # images = (image * 255).round().astype("uint8")
+        # import PIL.Image
+        # pil_images = [PIL.Image.fromarray(image) for image in images]
+        # for pos, i in enumerate(pil_images):
+        #     i.save(f"../dev/test/{pos}.png")
+
+        # show_images(batch)
+        show_images((image / 2 + 0.5).clamp(0, 1).cpu())
+    pass
+
+
 def setup_args(argv = None):
     import warnings
     warnings.filterwarnings("ignore")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("input_path")
-    parser.add_argument("output_path")
-    parser.add_argument("-a", "--augmentation", action = "store_true")
-    parser.add_argument("-n", "--number", type = int, default = 1)
-    parser.add_argument("-m", "--make_dirs", action = "store_true")
-    parser.add_argument("-d", "--device")
-    parser.add_argument("-N", "--num_workers", type = int, default = None)
-    parser.add_argument("-P", "--vae_name_or_path", default = "runwayml/stable-diffusion-v1-5")
-    parser.add_argument("-b", "--batch_size", type = int, default = 1)
-    parser.add_argument("-s", "--size", type = int, default = 512)
+    subp = parser.add_subparsers()
+    subp.required = True
+    convert_parser = subp.add_parser("convert")
+    convert_parser.set_defaults(fn = main_convert)
+    convert_parser.add_argument("input_path")
+    convert_parser.add_argument("output_path")
+    convert_parser.add_argument("-a", "--augmentation", action = "store_true")
+    convert_parser.add_argument("-n", "--number", type = int, default = 1)
+    convert_parser.add_argument("-m", "--make_dirs", action = "store_true")
+    convert_parser.add_argument("-d", "--device")
+    convert_parser.add_argument("-N", "--num_workers", type = int, default = None)
+    convert_parser.add_argument("-P", "--vae_name_or_path", default = "runwayml/stable-diffusion-v1-5")
+    convert_parser.add_argument("-b", "--batch_size", type = int, default = 1)
+    convert_parser.add_argument("-s", "--size", type = int, default = 512)
 
-    parser.add_argument("-i", "--image", action = "store_true")
-    parser.add_argument("-l", "--latents", action = "store_true")
+    convert_parser.add_argument("-i", "--image", action = "store_true")
+    convert_parser.add_argument("-l", "--latents", action = "store_true")
+
+    show_parser = subp.add_parser("show")
+    show_parser.set_defaults(fn = main_show)
+    show_parser.add_argument("zip_path")
+    show_parser.add_argument("-P", "--vae_name_or_path", default = "runwayml/stable-diffusion-v1-5")
+    show_parser.add_argument("-b", "--batch_size", type = int, default = 1)
+    show_parser.add_argument("-d", "--device")
+
     return parser.parse_args(argv) if argv else parser.parse_args()
 
 
 if __name__ == '__main__':
-    main(setup_args())
+    def _():
+        args = setup_args()
+        args.fn(args)
+
+
+    _()
