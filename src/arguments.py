@@ -151,9 +151,12 @@ def parse_args(input_args = None):
         ),
     )
     parser.add_argument(
+        "--checkpointing_skip_vae", action = "store_true",
+        help = "don't save VAE for checkpointing steps",
+    )
+    parser.add_argument(
         "--checkpoints_total_limit",
         type = int,
-        default = None,
         help = (
             "Max number of checkpoints to store. Passed as `total_limit` to the `Accelerator` `ProjectConfiguration`."
             " See Accelerator::save_state https://huggingface.co/docs/accelerate/package_reference/accelerator#accelerate.Accelerator.save_state"
@@ -163,7 +166,6 @@ def parse_args(input_args = None):
     parser.add_argument(
         "--resume_from_checkpoint",
         type = str,
-        default = None,
         help = (
             "Whether training should be resumed from a previous checkpoint. Use a path saved by"
             ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
@@ -268,34 +270,42 @@ def parse_args(input_args = None):
         help = "A prompt that is used during validation to verify that the model is learning.",
     )
     parser.add_argument(
-        "--num_validation_images",
+        "--validation_batches",
         type = int,
         default = 4,
-        help = "Number of images that should be generated during validation with `validation_prompt`.",
+        help = "Number of images per prompt that should be generated during validation with `validation_prompt`.",
     )
+    parser.add_argument(
+        "--validation_batch_size",
+        type = int,
+        default = 1,
+        help = "batch size for creating validation images",
+
+    )
+
     parser.add_argument(
         "--validation_steps",
         type = int,
         default = 100,
         help = (
             "Run validation every X steps. Validation consists of running the prompt"
-            " `args.validation_prompt` multiple times: `args.num_validation_images`"
+            " `args.validation_prompt` multiple times: `args.validation_batches`"
             " and logging the images."
         ),
+    )
+    parser.add_argument(
+        "--validation_at_start", action = "store_true",
+        help = "Run validation before start",
+    )
+    parser.add_argument(
+        "--validation_at_end", action = "store_true",
+        help = "Run validation after last step",
     )
     parser.add_argument(
         "--no_validation_clean",
         action = "store_false",
         dest = "validation_clean",
         help = ("dont reduce memory before validation run"),
-    )
-    parser.add_argument(
-        "--validation_batch_size",
-        type = int,
-        default = 2,
-        help = (
-            "batch size for creating validation images"
-        ),
     )
     parser.add_argument(
         "--mixed_precision",

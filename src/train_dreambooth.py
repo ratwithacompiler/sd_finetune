@@ -70,8 +70,16 @@ from fastai.data.core import DataLoaders
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 diffusers.utils.check_min_version("0.15.0")
+print("diffusers", diffusers.__version__)
 
 logger = get_logger(__name__)
+
+try:
+    import safetensors
+
+    is_safetensors_available = True
+except ImportError:
+    is_safetensors_available = False
 
 import sys
 
@@ -131,11 +139,11 @@ def clean_mem():
 def log_validation(
         text_encoder, tokenizer, unet, vae, args, accelerator, epoch, vae_dtype,
         pipeline = None,
-        num_inference_steps = 22,
+        num_inference_steps = 30,
 ):
     clean_mem()
     logger.info(
-        f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
+        f"Running validation... \n Generating {args.validation_batches} images with prompt:"
         f" {args.validation_prompt}."
     )
 
@@ -170,14 +178,15 @@ def log_validation(
         pass
 
     # run inference
-    generator = None if args.seed is None else torch.Generator(device = accelerator.device).manual_seed(args.seed)
+
     images = []
-    for _ in range(args.num_validation_images):
-        with torch.autocast("cuda"):
-            for prompt in args.validation_prompt:
+    with torch.autocast("cuda"):
+        for prompt in args.validation_prompt:
+            generator = None if args.seed is None else torch.Generator(device = accelerator.device).manual_seed(args.seed)
+            for _ in range(args.validation_batches):
                 imgbatch = pipeline(
                     prompt, num_inference_steps = num_inference_steps, generator = generator,
-                    num_images_per_prompt = max(1, args.validation_batch_size)
+                    num_images_per_prompt = max(1, args.validation_batch_size or 0)
                 ).images
                 images.extend(((prompt, i) for i in imgbatch))
 
@@ -288,7 +297,7 @@ class TrainContext():
     model: "Model" = None
     args: any = None
     accelerator: Any = None
-    step: Any = None
+    global_step: Any = None
     img_batch_size: int = None
     reg_batch_size: int = None
     batch_size: int = None
@@ -306,11 +315,11 @@ class TrainContext():
     def _encode_text(self, ids):
         return self.text_encoder(ids)
 
-    def make_save_path(self):
-        step = self.learn.iter
+    def make_save_path(self, global_step = None):
+        global_step = (self.global_step if global_step is None else global_step) or 0
         epoch = self.learn.epoch
         output_dir = Path(self.args.output_dir)
-        model_path = output_dir / f"model_s{step}_e{epoch}_{int(time.time_ns())}"
+        model_path = output_dir / f"model_s{global_step}_e{epoch}_b{self.batch_size}_t{int(time.time_ns())}"
         model_path.mkdir(exist_ok = True)
         return str(model_path)
 
@@ -437,13 +446,24 @@ def init(ctx: TrainContext):
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-        # TODO: fix
+        print("save state prehook")
+
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             for model in models:
-                sub_dir = "unet" if type(model) == type(models.unet) else "text_encoder"
-                model.save_pretrained(os.path.join(output_dir, sub_dir))
-
+                if isinstance(model, UNet2DConditionModel):
+                    sub_dir = "unet"
+                elif isinstance(model, CLIPTextModel):
+                    sub_dir = "text_encoder"
+                elif isinstance(model, AutoencoderKL):
+                    if args.checkpointing_skip_vae:
+                        print("skipping saving vae")
+                        sub_dir = "vae"
+                        weights.pop()
+                        continue
+                else:
+                    raise ValueError("unexpected model type", type(model), model)
+                model.save_pretrained(os.path.join(output_dir, sub_dir), safe_serialization = is_safetensors_available)
                 # make sure to pop weight so that corresponding model is not saved again
                 weights.pop()
 
@@ -617,11 +637,22 @@ class Trainer(Callback):
         self.validate_soon = False
 
     def before_fit(self):
-        if self.ctx.step is None:  # TODO: use learner iter?
-            self.ctx.step = 0
+        if self.ctx.global_step is None:
+            self.ctx.global_step = 0
+
+        if self.ctx.accelerator.is_main_process and self.ctx.args.validation_at_start:
+            self._validate()
+
+        # if IS_DEV:
+        #     save_path = self.ctx.make_save_path()
+        #     print("before_fit saving to", save_path)
+        #     self.ctx.accelerator.save_state(save_path)
+        #     logger.info(f"Saved state to {save_path}")
+        #     exit()
+        pass
 
     def before_batch(self):
-        self.ctx.step += 1
+        self.ctx.global_step += 1
         batch = self.learn.xb[0]
 
         pixels = batch.pop("pixel_values")
@@ -631,9 +662,11 @@ class Trainer(Callback):
             latents = latents.to(self.ctx.unet.dtype) * self.ctx.vae.config.scaling_factor
             batch["latents"] = latents.to(self.ctx.accelerator.device)
         else:
-            latents = batch["latents"].to(self.ctx.accelerator.device)
+            # just hardcode vae scaling, it's not even in the official config and just using the AutoKL default
+            # so would have to basically instantiate vae just to get it, not worth
+            latents = batch["latents"].to(self.ctx.accelerator.device) * 0.18215
 
-        # Sample noise that we'll add to the latents
+            # Sample noise that we'll add to the latents
         if self.ctx.args.offset_noise:
             noise = batch["noise"] = torch.randn_like(latents) + 0.1 * torch.randn(
                 latents.shape[0], latents.shape[1], 1, 1, device = latents.device
@@ -674,35 +707,41 @@ class Trainer(Callback):
 
     def after_batch(self):
         ctx = self.ctx
-        args, step, accelerator = ctx.args, ctx.step, ctx.accelerator
+        args, global_step, accelerator = ctx.args, ctx.global_step, ctx.accelerator
 
-        if accelerator.is_main_process:
-            if step % args.checkpointing_steps == 0:  # TODO: yee
-                save_path = os.path.join(args.output_dir, f"checkpoint-{step}")  # TODO: use ctx path
+        if accelerator.is_main_process and args.checkpointing_steps:
+            if global_step % args.checkpointing_steps == 0:
+                save_path = ctx.make_save_path()
                 accelerator.save_state(save_path)
                 logger.info(f"Saved state to {save_path}")
 
-            if args.validation_prompt is not None and step % args.validation_steps == 0:
+            if args.validation_steps and args.validation_prompt is not None and global_step % args.validation_steps == 0:
                 self.validate_soon = True
 
-    def after_backward(self):
-        ctx = self.ctx
-        args, accelerator = ctx.args, ctx.accelerator
-        if accelerator.sync_gradients and self.validate_soon:
-            with Timed("Validation images"):
-                self.validate_soon = False
-                try:
-                    if ctx.args.validation_clean:
-                        self.learn.opt.zero_grad(set_to_none = True)
+        if self.ctx.accelerator.is_main_process and self.ctx.accelerator.sync_gradients and self.validate_soon:
+            self.validate_soon = False
+            self._validate()
 
-                    log_validation(ctx.text_encoder, ctx.tokenizer, ctx.unet, ctx.vae, args, accelerator, self.learn.epoch, ctx.weight_dtype)
+    def after_fit(self):
+        if self.ctx.accelerator.is_main_process and self.ctx.args.validation_at_end:
+            self._validate()
 
-                    if ctx.args.validation_clean and not ctx.args.set_grads_to_none:
-                        self.learn.opt.zero_grad(set_to_none = False)
-                except:
-                    logger.exception("log_validation failed")
-                finally:
-                    clean_mem()
+    def _validate(self):
+        # TODO: only im main process??
+        with Timed("Creating Validation images"):
+            ctx = self.ctx
+            try:
+                if ctx.args.validation_clean:
+                    self.learn.opt.zero_grad(set_to_none = True)
+
+                log_validation(ctx.text_encoder, ctx.tokenizer, ctx.unet, ctx.vae, ctx.args, ctx.accelerator, self.learn.epoch, ctx.weight_dtype)
+
+                if ctx.args.validation_clean and not ctx.args.set_grads_to_none:
+                    self.learn.opt.zero_grad(set_to_none = False)
+            except:
+                logger.exception("log_validation failed")
+            finally:
+                clean_mem()
 
     def after_step(self):
         if self.ctx.args.set_grads_to_none:
@@ -783,7 +822,7 @@ class RegBatchImages(Callback):
             "prior_loss":      prior_loss.item(),
             "prior_loss_adj":  prior_loss_adj.item(),
             "loss_prio_ratio": (loss / prior_loss).item(),
-        }, step = self.learn.ctx.step)
+        }, step = self.learn.ctx.global_step)
 
         return F.mse_loss(pred, yb, reduction = "mean")
 
@@ -945,7 +984,7 @@ def setup1(args, devmodel = False):
         ctx.train_dataloader, ctx.train_reg_dataloader = train_dataloader, train_reg_dataloader
         ctx.tokenizer = load_tokenizer(args)
         ctx.set_cached(not args.train_text_encoder)
-        if ctx.vae:
+        if ctx.vae is not None:
             ctx.vae.requires_grad_(False)
         ctx.text_encoder.requires_grad_(bool(args.train_text_encoder))
         ctx.args = args
@@ -1110,6 +1149,9 @@ def setup2(ctx: TrainContext, init_trackers = True):
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     logger.info("args %s", ctx.args)
 
+    for k, v in sorted(vars(ctx.args).items()):
+        print(f"{k:<30s}: {v}")
+
     if IS_DEV:
         ctx.unet.set_attention_slice(1)
 
@@ -1180,11 +1222,11 @@ def main(args, run_lr_find: bool = False):
     optim = make_optimizer(ctx.args)
     loss_fn = get_loss_fn(callbacks, trainercb.loss)
 
-    if run_lr_find or IS_DEV:
+    if run_lr_find:  # or IS_DEV:
         print("lr_find")
         import fastai.callback.schedule
         args.validation_steps = args.checkpointing_steps = None
-        learn = Learner(dls, model, loss_fn, optim, args.learning_rate, cbs = [trainercb] + callbacks)
+        ctx.learn = learn = Learner(dls, model, loss_fn, optim, args.learning_rate, cbs = [trainercb] + callbacks)
         learn.lr_find()
         return learn
 
@@ -1210,7 +1252,8 @@ def main(args, run_lr_find: bool = False):
     accelerator.wait_for_everyone()
     print("done", accelerator.is_main_process)
     if accelerator.is_main_process and not IS_DEV:
-        print("done, saving", accelerator.is_main_process)
+        save_path = ctx.make_save_path()
+        print("done, saving to", repr(save_path))
         pipeline = DiffusionPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
             unet = accelerator.unwrap_model(ctx.unet),
@@ -1220,7 +1263,7 @@ def main(args, run_lr_find: bool = False):
             feature_extractor = None,
             requires_safety_checker = False
         )
-        pipeline.save_pretrained(ctx.make_save_path())
+        pipeline.save_pretrained(save_path, safe_serialization = is_safetensors_available)
         pipeline.enable_attention_slicing()
 
     accelerator.end_training()
