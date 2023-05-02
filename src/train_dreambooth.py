@@ -321,7 +321,9 @@ class TrainContext():
         global_step = (self.global_step if global_step is None else global_step) or 0
         epoch = self.learn.epoch
         output_dir = Path(self.args.output_dir)
-        model_path = output_dir / f"model_s{global_step}_e{epoch}_b{self.batch_size}_t{int(time.time_ns())}"
+        gstep_t = self.global_train_images or 0
+        gstep_r = self.global_reg_images or 0
+        model_path = output_dir / f"model_g{global_step}_i{gstep_t + gstep_r}_t{gstep_t}_r{gstep_r}_e{epoch}_b{self.batch_size}_t{int(time.time_ns())}"
         model_path.mkdir(exist_ok = True)
         return str(model_path)
 
@@ -452,6 +454,7 @@ def init(ctx: TrainContext):
 
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
+            assert len(models) == len(weights)
             for model in models:
                 if isinstance(model, UNet2DConditionModel):
                     sub_dir = "unet"
@@ -697,7 +700,7 @@ class Trainer(Callback):
         for prefix in ("", "reg_"):
             if batch.get(prefix + "pixel_values") is not None:
                 # TODI: encode both together in case of reg images?
-                pixels = batch.get(prefix + "pixel_values")
+                pixels = batch.pop(prefix + "pixel_values")
                 latents.append(self.ctx.vae.encode(pixels.to(dtype = self.ctx.vae.dtype)).latent_dist.sample())
             if batch.get(prefix + "latents") is not None:
                 latents.append(batch.get(prefix + "latents"))

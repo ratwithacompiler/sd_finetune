@@ -403,6 +403,8 @@ def parse_args(input_args = None):
         # logger is not available yet
         if args.class_data_dir is not None:
             warnings.warn("You need not use --class_data_dir without --with_prior_preservation.")
+        if args.class_latent_zip is not None:
+            warnings.warn("You need not use --class_latent_zip without --with_prior_preservation.")
         if args.class_prompt is not None:
             warnings.warn("You need not use --class_prompt without --with_prior_preservation.")
 
