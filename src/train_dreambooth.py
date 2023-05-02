@@ -298,6 +298,8 @@ class TrainContext():
     args: any = None
     accelerator: Any = None
     global_step: Any = None
+    global_train_images: Any = None
+    global_reg_images: Any = None
     img_batch_size: int = None
     reg_batch_size: int = None
     batch_size: int = None
@@ -624,6 +626,19 @@ class DevModel(torch.nn.Module):
         return self.conv(x)
 
 
+def _cat(tensors, device = None, dtype = None):
+    tensors = list(tensors)
+    if device is not None:
+        tensors = [i.to(device) for i in tensors]
+    if dtype is not None:
+        tensors = [i.to(dtype) for i in tensors]
+
+    if len(tensors) == 1:
+        return tensors[0]
+
+    return torch.cat(tensors)
+
+
 class Trainer(Callback):
     name = "TrainCb"
     run_valid = False
@@ -636,9 +651,18 @@ class Trainer(Callback):
         self.ctx = ctx
         self.validate_soon = False
 
+        self.last_checkpointing_image_steps = None
+        self.last_validation_image_steps = None
+
     def before_fit(self):
         if self.ctx.global_step is None:
             self.ctx.global_step = 0
+
+        if self.ctx.global_train_images is None:
+            self.ctx.global_train_images = 0
+
+        if self.ctx.global_reg_images is None:
+            self.ctx.global_reg_images = 0
 
         if self.ctx.accelerator.is_main_process and self.ctx.args.validation_at_start:
             self._validate()
@@ -651,22 +675,59 @@ class Trainer(Callback):
         #     exit()
         pass
 
-    def before_batch(self):
-        self.ctx.global_step += 1
-        batch = self.learn.xb[0]
-
-        pixels = batch.pop("pixel_values")
+    def _v0(self, batch):
+        pixels = batch.get("pixel_values")
         if pixels is not None:
             assert not batch.get("latents")
             latents = self.ctx.vae.encode(pixels.to(dtype = self.ctx.vae.dtype)).latent_dist.sample()
             latents = latents.to(self.ctx.unet.dtype) * self.ctx.vae.config.scaling_factor
-            batch["latents"] = latents.to(self.ctx.accelerator.device)
+            latents.to(self.ctx.accelerator.device)
         else:
             # just hardcode vae scaling, it's not even in the official config and just using the AutoKL default
             # so would have to basically instantiate vae just to get it, not worth
             latents = batch["latents"].to(self.ctx.accelerator.device) * 0.18215
 
-            # Sample noise that we'll add to the latents
+        input_ids = batch["input_ids"]
+        return latents, input_ids
+
+    def get_latents(self, batch):
+        #
+        latents = []
+        input_ids = []
+        for prefix in ("", "reg_"):
+            if batch.get(prefix + "pixel_values") is not None:
+                # TODI: encode both together in case of reg images?
+                pixels = batch.get(prefix + "pixel_values")
+                latents.append(self.ctx.vae.encode(pixels.to(dtype = self.ctx.vae.dtype)).latent_dist.sample())
+            if batch.get(prefix + "latents") is not None:
+                latents.append(batch.get(prefix + "latents"))
+
+            if batch.get(prefix + "input_ids") is not None:
+                _ids = batch.get(prefix + "input_ids")
+                input_ids.append(_ids)
+                if prefix == "":
+                    self.ctx.global_train_images += _ids.shape[0]
+                else:
+                    self.ctx.global_reg_images += _ids.shape[0]
+
+        latents = _cat(latents, self.ctx.accelerator.device, self.ctx.unet.dtype)
+        input_ids = _cat(input_ids, self.ctx.accelerator.device)
+        # just hardcode vae scaling, it's not even in the official config and just using the AutoKL default
+        # so would have to basically instantiate vae once at startup (when in latent mode and not using a vae)
+        # just to get the value and then delete the vae again, not worth.
+        latents = latents * 0.18215
+        assert latents.shape[0] == input_ids.shape[0]
+        # print("latentsv1", latents.mean(), latents.min(), latents.max(), latents.var(), latents.view(-1)[:10])
+        return latents, input_ids
+
+    def before_batch(self):
+        self.ctx.global_step += 1
+        batch = self.learn.xb[0]
+        latents, input_ids = self.get_latents(batch)
+        batch["latents"] = latents
+        batch["input_ids"] = input_ids
+
+        # Sample noise that we'll add to the latents
         if self.ctx.args.offset_noise:
             noise = batch["noise"] = torch.randn_like(latents) + 0.1 * torch.randn(
                 latents.shape[0], latents.shape[1], 1, 1, device = latents.device
@@ -676,7 +737,7 @@ class Trainer(Callback):
 
         context = contextlib.nullcontext() if self.ctx.args.train_text_encoder else torch.no_grad()
         with context:
-            batch["encoded_text"] = self.ctx.encode_text(batch["input_ids"]).last_hidden_state
+            batch["encoded_text"] = self.ctx.encode_text(input_ids).last_hidden_state
 
         # Sample a random timestep for each image
         timesteps = torch.randint(0, self.ctx.noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device = latents.device)
@@ -710,13 +771,30 @@ class Trainer(Callback):
         args, global_step, accelerator = ctx.args, ctx.global_step, ctx.accelerator
 
         if accelerator.is_main_process and args.checkpointing_steps:
-            if global_step % args.checkpointing_steps == 0:
+            save = False
+            if args.checkpointing_steps:
+                save = global_step % args.checkpointing_steps == 0
+
+            global_images = (self.ctx.global_train_images or 0) + (self.ctx.global_train_images or 0)
+            if args.checkpointing_image_steps:
+                next = (self.last_checkpointing_image_steps or 0) + args.checkpointing_image_steps
+                if global_images >= next:
+                    self.last_checkpointing_image_steps = next
+                    save = True
+
+            if save:
                 save_path = ctx.make_save_path()
                 accelerator.save_state(save_path)
                 logger.info(f"Saved state to {save_path}")
 
             if args.validation_steps and args.validation_prompt is not None and global_step % args.validation_steps == 0:
                 self.validate_soon = True
+
+            if args.validation_image_steps and args.validation_prompt is not None:
+                next = (self.last_validation_image_steps or 0) + args.validation_image_steps
+                if global_images >= next:
+                    self.last_validation_image_steps = next
+                    self.validate_soon = True
 
         if self.ctx.accelerator.is_main_process and self.ctx.accelerator.sync_gradients and self.validate_soon:
             self.validate_soon = False
@@ -780,13 +858,17 @@ class RegBatchImages(Callback):
         reg = next(self.reg_dl_cycle)[0]
 
         assert reg["pixel_values"].shape[0] == reg["input_ids"].shape[0]
+        # TODO: check that works at the end of one reg iter
+        # and doesnt return one smaller batch at last
         assert reg["pixel_values"].shape[0] == self.ctx.reg_batch_size
 
-        self.last_img_batchsize = batch["pixel_values"].shape[0]
+        is_pixels, is_latents = batch.get("pixel_values") is not None, batch.get("latents") is not None
+        assert is_pixels != is_latents
+        self.last_img_batchsize = (batch["latents"] if is_latents else batch["pixel_values"]).shape[0]
 
-        # cat reg batch on top of normal batch
-        batch["pixel_values"] = torch.cat((batch["pixel_values"], reg["pixel_values"].to(batch["pixel_values"].device)))
-        batch["input_ids"] = torch.cat((batch["input_ids"], reg["input_ids"].to(batch["input_ids"].device)))
+        # cat reg batch on top of normal batch if exists
+        batch["reg_pixel_values"] = reg["pixel_values"]
+        batch["reg_input_ids"] = reg["input_ids"]
 
     def loss(self, pred, yb):
         if pred is None:
@@ -844,11 +926,13 @@ class RegBatchLatents(RegBatchImages):
         assert reg["latents"].shape[0] == reg["input_ids"].shape[0]
         assert reg["latents"].shape[0] == self.ctx.reg_batch_size
 
-        self.last_img_batchsize = batch["latents"].shape[0]
+        is_pixels, is_latents = batch.get("pixel_values") is not None, batch.get("latents") is not None
+        assert is_pixels != is_latents
+        self.last_img_batchsize = (batch["latents"] if is_latents else batch["pixel_values"]).shape[0]
 
-        # cat reg batch on top of normal batch
-        batch["latents"] = torch.cat((batch["latents"], reg["latents"].to(batch["latents"].device)))
-        batch["input_ids"] = torch.cat((batch["input_ids"], reg["input_ids"].to(batch["input_ids"].device)))
+        # cat reg batch on top of normal batch if exists
+        batch["reg_latents"] = reg["latents"]
+        batch["reg_input_ids"] = reg["input_ids"]
 
 
 class PrintProgressCB(Callback):
@@ -857,10 +941,10 @@ class PrintProgressCB(Callback):
     order = -10
 
     def before_epoch(self):
-        print(f"starting epoch {self.learn.epoch} of {self.learn.n_epoch}")
+        print(f"starting epoch {self.learn.epoch} of {self.learn.n_epoch}, global step {self.learn.ctx.global_step}")
 
     def before_batch(self):
-        print(f"starting batch {self.learn.iter} of {self.learn.n_iter}")
+        print(f"starting batch {self.learn.iter} of {self.learn.n_iter}, global step {self.learn.ctx.global_step}")
 
 
 class TqdmProgressCB(Callback):
@@ -873,7 +957,7 @@ class TqdmProgressCB(Callback):
         self.pbar = None
 
     def before_epoch(self):
-        print(f"starting epoch {self.learn.epoch} of {self.learn.n_epoch}")
+        print(f"starting epoch {self.learn.epoch} of {self.learn.n_epoch}, global step {self.learn.ctx.global_step}")
 
     def before_batch(self):
         # print(f"starting batch {self.learn.iter} of {self.learn.n_iter}")
@@ -1225,7 +1309,7 @@ def main(args, run_lr_find: bool = False):
     if run_lr_find:  # or IS_DEV:
         print("lr_find")
         import fastai.callback.schedule
-        args.validation_steps = args.checkpointing_steps = None
+        args.validation_steps, args.validation_image_steps = args.checkpointing_steps = args.checkpointing_image_steps = None
         ctx.learn = learn = Learner(dls, model, loss_fn, optim, args.learning_rate, cbs = [trainercb] + callbacks)
         learn.lr_find()
         return learn

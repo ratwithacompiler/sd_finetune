@@ -14,8 +14,6 @@ from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from pathlib import Path
 
-from dataload import LatentZipDataset
-
 
 def dir_files_cleaned(dir: Path, sort = True):
     files = []
@@ -62,14 +60,15 @@ def make_col(args, device, size):
     if not args.augmentation:
         print("no augmentation")
         tfms = transforms.Compose([
+            transforms.ConvertImageDtype(torch.float32),
             transforms.Resize((size)),
             transforms.RandomCrop((size, size)),
-            transforms.ConvertImageDtype(torch.float32),
             transforms.Normalize([0.5], [0.5]),
         ])
     else:
         print("default augmentation")
         tfms = transforms.Compose([
+            transforms.ConvertImageDtype(torch.float32),
             # transforms.RandomPerspective(0.1, 1),
             # transforms.RandomRotation(4, InterpolationMode.NEAREST),
             # torchvision.transforms.v2.RandomIoUCrop(),
@@ -99,7 +98,6 @@ def make_col(args, device, size):
             transforms.ColorJitter(contrast = 0.15),
             transforms.ColorJitter(saturation = 0.15),
             transforms.ColorJitter(hue = 0.01),
-            transforms.ConvertImageDtype(torch.float32),
             transforms.Normalize([0.5], [0.5]),
             # transforms.RandomRotation
             # transforms.ColorJitter
@@ -160,9 +158,9 @@ def main_convert(args):
     collate_device = device
 
     if IS_DEV:
-        args.input_path = "../dev/data2_smol/"
         args.input_path = "../dev/data1"
         args.input_path = "../dev/data2"
+        args.input_path = "../dev/data2_smol/"
         args.batch_size = 4
         # size = (512, 512)
         args.size = 64
@@ -170,7 +168,7 @@ def main_convert(args):
         args.make_dirs = True
         # args.latents = True
         args.image = True
-        args.number = 4
+        args.number = 1
         collate_device = "cpu"
         pass
 
@@ -193,7 +191,7 @@ def main_convert(args):
         exit(1)
 
     size = args.size
-    vae = AutoencoderKL.from_pretrained(args.vae_name_or_path, subfolder = "vae")
+    vae = AutoencoderKL.from_pretrained(args.vae_name_or_path, subfolder = args.vae_subfolder)
     vae = vae.to(device)
 
     train_dataset = ImageDs(args.input_path)
@@ -222,10 +220,13 @@ def main_convert(args):
     #     shuffle = True,
     #     collate_fn = dictcol,
     # )
-    to_int = T.ConvertImageDtype(torch.uint8)
+    # to_int = T.ConvertImageDtype(torch.uint8)
+
 
     for pos, (names, batch) in progress(enumerate(train_dataloader)):
-        print("pos", pos)
+        # show_images((batch / 2 + 0.5).clamp(0, 1).cpu())
+        # continue
+        # print("pos", pos)
         batch: torch.Tensor
         bs = batch.shape[0]
 
@@ -289,6 +290,7 @@ def show_collate_fn(examples: List[dict]) -> dict:
 
 
 def main_show(args):
+    from dataload import LatentZipDataset
     torch.set_grad_enabled(False)
     if args.device:
         device = torch.device(args.device)
@@ -303,7 +305,7 @@ def main_show(args):
         collate_fn = show_collate_fn,
     )
 
-    vae = AutoencoderKL.from_pretrained(args.vae_name_or_path, subfolder = "vae")
+    vae = AutoencoderKL.from_pretrained(args.vae_name_or_path, subfolder = args.vae_subfolder)
     vae = vae.to(device)
 
     for batch in train_dataloader:
@@ -340,7 +342,8 @@ def setup_args(argv = None):
     convert_parser.add_argument("-m", "--make_dirs", action = "store_true")
     convert_parser.add_argument("-d", "--device")
     convert_parser.add_argument("-N", "--num_workers", type = int, default = None)
-    convert_parser.add_argument("-P", "--vae_name_or_path", default = "runwayml/stable-diffusion-v1-5")
+    convert_parser.add_argument("-P", "--vae_name_or_path", default = "stabilityai/sd-vae-ft-mse")
+    convert_parser.add_argument("--vae_subfolder")
     convert_parser.add_argument("-b", "--batch_size", type = int, default = 1)
     convert_parser.add_argument("-s", "--size", type = int, default = 512)
 
@@ -350,7 +353,8 @@ def setup_args(argv = None):
     show_parser = subp.add_parser("show")
     show_parser.set_defaults(fn = main_show)
     show_parser.add_argument("zip_path")
-    show_parser.add_argument("-P", "--vae_name_or_path", default = "runwayml/stable-diffusion-v1-5")
+    show_parser.add_argument("-P", "--vae_name_or_path", default = "stabilityai/sd-vae-ft-mse")
+    show_parser.add_argument("--vae_subfolder")
     show_parser.add_argument("-b", "--batch_size", type = int, default = 1)
     show_parser.add_argument("-d", "--device")
 

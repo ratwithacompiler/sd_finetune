@@ -4,8 +4,8 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset
-from PIL import Image
 from torchvision import transforms
+from torchvision.io import read_image
 
 
 def dir_files_cleaned(dir: Path, sort = True):
@@ -51,19 +51,19 @@ class DreamBoothDataset(Dataset):
         self.instance_images_path = dir_files_cleaned(self.instance_data_root)
         self.num_instance_images = len(self.instance_images_path)
         self.instance_prompt = instance_prompt
-        self._length = self.num_instance_images
+
+        from torchvision.io import ImageReadMode
+        self.image_read_mode = ImageReadMode.RGB
 
     def __len__(self):
-        return self._length
+        return self.num_instance_images
 
     def __getitem__(self, index):
         example = { }
-        instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
-        if not instance_image.mode == "RGB":
-            instance_image = instance_image.convert("RGB")
 
-        # example["instance_images"] = self.image_transforms(instance_image)
+        instance_image = read_image(str(self.instance_images_path[index]), self.image_read_mode)
         example["instance_images"] = instance_image
+
         if self.instance_prompt is not None:
             example["instance_prompt_ids"] = self.tokenizer(
                 self.instance_prompt,
@@ -141,9 +141,9 @@ class TransformedDataset(Dataset):
 def transforms_center_crop(size):
     return transforms.Compose(
         [
-            transforms.Resize(size, interpolation = transforms.InterpolationMode.BILINEAR),
+            transforms.ConvertImageDtype(torch.float32),
+            transforms.Resize(size, interpolation = transforms.InterpolationMode.BILINEAR, antialias = True),
             transforms.CenterCrop(size),
-            transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
     )
@@ -152,9 +152,9 @@ def transforms_center_crop(size):
 def transforms_random_crop(size):
     return transforms.Compose(
         [
-            transforms.Resize(size, interpolation = transforms.InterpolationMode.BILINEAR),
+            transforms.ConvertImageDtype(torch.float32),
+            transforms.Resize(size, interpolation = transforms.InterpolationMode.BILINEAR, antialias = True),
             transforms.RandomCrop(size),
-            transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
     )

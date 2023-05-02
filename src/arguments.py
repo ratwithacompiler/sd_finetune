@@ -141,7 +141,7 @@ def parse_args(input_args = None):
     parser.add_argument(
         "--checkpointing_steps",
         type = int,
-        default = 500,
+        default = None,
         help = (
             "Save a checkpoint of the training state every X updates. Checkpoints can be used for resuming training via `--resume_from_checkpoint`. "
             "In the case that the checkpoint is better than the final trained model, the checkpoint can also be used for inference."
@@ -149,6 +149,12 @@ def parse_args(input_args = None):
             "See https://huggingface.co/docs/diffusers/main/en/training/dreambooth#performing-inference-using-a-saved-checkpoint for step by step"
             "instructions."
         ),
+    )
+    parser.add_argument(
+        "--checkpointing_image_steps",
+        type = int,
+        default = None,
+        help = "like --checkpointing_image_steps but by number of images trained instead of steps, equivalent at batch_size 1 single device",
     )
     parser.add_argument(
         "--checkpointing_skip_vae", action = "store_true",
@@ -286,13 +292,21 @@ def parse_args(input_args = None):
     parser.add_argument(
         "--validation_steps",
         type = int,
-        default = 100,
+        default = None,
         help = (
             "Run validation every X steps. Validation consists of running the prompt"
             " `args.validation_prompt` multiple times: `args.validation_batches`"
             " and logging the images."
         ),
     )
+
+    parser.add_argument(
+        "--validation_image_steps",
+        type = int,
+        default = None,
+        help = "like --validation_steps but by number of images trained instead of steps, equivalent at batch_size 1 single device",
+    )
+
     parser.add_argument(
         "--validation_at_start", action = "store_true",
         help = "Run validation before start",
