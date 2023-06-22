@@ -76,6 +76,20 @@ class DreamBoothDataset(Dataset):
         return example
 
 
+class RepeatedDataset(Dataset):
+    def __init__(self, ds: Dataset, repeat: int):
+        self.ds = ds
+        self.ds_len = len(ds)
+        self.repeat = int(repeat)
+        self._length = self.ds_len * self.repeat
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, index):
+        return self.ds[index % self.ds_len]
+
+
 class LatentZipDataset(Dataset):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
@@ -95,6 +109,7 @@ class LatentZipDataset(Dataset):
         self.zip_file = zipfile.ZipFile(zip_path, "r")
         filenames = self.zip_file.namelist()
         self.filenames = [i for i in filenames if not i.startswith(".")]
+        # self.filenames = [i for i in filenames if not i.startswith("mpv-shot0004_b")]
 
         self.num_instance_images = len(self.filenames)
         self.instance_prompt = instance_prompt

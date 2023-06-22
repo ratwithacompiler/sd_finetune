@@ -23,6 +23,12 @@ def parse_args(input_args = None):
         ),
     )
     parser.add_argument(
+        "--fallback_pretrained_model_name_or_path",
+        type = str,
+        default = "runwayml/stable-diffusion-v1-5",
+        help = "Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
         "--tokenizer_name",
         type = str,
         default = None,
@@ -107,6 +113,12 @@ def parse_args(input_args = None):
         ),
     )
     parser.add_argument(
+        "--instance-image-repeat",
+        type = int,
+        default = None,
+        help = "instace image repeat per epoch",
+    )
+    parser.add_argument(
         "--center_crop",
         default = False,
         action = "store_true",
@@ -138,6 +150,12 @@ def parse_args(input_args = None):
         default = None,
         help = "Total number of training steps to perform.  If provided, overrides num_train_epochs.",
     )
+    # parser.add_argument(
+    #     "--max_train_image_steps",
+    #     type = int,
+    #     default = None,
+    #     help = "like --max_train_steps but by number of images trained instead of steps, equivalent at batch_size 1 single device",
+    # )
     parser.add_argument(
         "--checkpointing_steps",
         type = int,
@@ -235,7 +253,7 @@ def parse_args(input_args = None):
     parser.add_argument("--adam_weight_decay", type = float, default = 1e-2, help = "Weight decay to use.")
     parser.add_argument("--adam_epsilon", type = float, default = 1e-08, help = "Epsilon value for the Adam optimizer")
     parser.add_argument("--max_grad_norm", default = 1.0, type = float, help = "Max gradient norm.")
-    parser.add_argument("--push_to_hub", action = "store_true", help = "Whether or not to push the model to the Hub.")
+    parser.add_argument("--original_weight_decay", type = float, default = None, help = "")
     parser.add_argument("--hub_token", type = str, default = None, help = "The token to use to push to the Model Hub.")
     parser.add_argument(
         "--hub_model_id",
@@ -298,6 +316,13 @@ def parse_args(input_args = None):
             " `args.validation_prompt` multiple times: `args.validation_batches`"
             " and logging the images."
         ),
+    )
+
+    parser.add_argument(
+        "--validation_sample_steps",
+        type = int,
+        default = 30,
+        help = "Number of Sample steps for validation images",
     )
 
     parser.add_argument(

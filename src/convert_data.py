@@ -4,6 +4,7 @@ import itertools
 import math
 import os
 import sys
+from zipfile import ZipFile
 from functools import partial
 from typing import List
 
@@ -69,12 +70,6 @@ def make_col(args, device, size):
         print("default augmentation")
         tfms = transforms.Compose([
             transforms.ConvertImageDtype(torch.float32),
-            # transforms.RandomPerspective(0.1, 1),
-            # transforms.RandomRotation(4, InterpolationMode.NEAREST),
-            # torchvision.transforms.v2.RandomIoUCrop(),
-            # torchvision.transforms.v2.RandomResizedCrop(size),
-            # torchvision.transforms.v2.Resize(128),
-            # torchvision.transforms.v2.RandomResizedCrop(128, scale = (0.9,1)),
             torchvision.transforms.v2.RandomPerspective(0.1, p = 0.3),
             torchvision.transforms.v2.RandomAffine(
                 # degrees = 0,
@@ -89,8 +84,6 @@ def make_col(args, device, size):
                 # scale = (1.0, 1.06),
                 interpolation = InterpolationMode.BILINEAR,
             ),
-            # torchvision.transforms.v2.RandomCrop(128),
-            # transforms.Resize((size, size)),
             transforms.Resize((size)),
             transforms.RandomCrop((size, size)),
             transforms.RandomHorizontalFlip(),
@@ -175,14 +168,18 @@ def main_convert(args):
     eprint("device:", device)
     eprint("collate_device:", collate_device)
 
+    zip_write = False
     output_path = Path(args.output_path)
-    if not output_path.is_dir():
-        if args.make_dirs:
-            eprint(f"creating output dir: {str(output_path)!r}")
-            output_path.mkdir(parents = True)
-        else:
-            eprint(f"Error: output_path not found: {str(output_path)!r}")
-            exit(1)
+    if output_path.name.endswith(".zip"):
+        zip_write = True
+    else:
+        if not output_path.is_dir():
+            if args.make_dirs:
+                eprint(f"creating output dir: {str(output_path)!r}")
+                output_path.mkdir(parents = True)
+            else:
+                eprint(f"Error: output_path not found: {str(output_path)!r}")
+                exit(1)
 
     save_image = args.image
     save_latents = args.latents
@@ -220,8 +217,23 @@ def main_convert(args):
     #     shuffle = True,
     #     collate_fn = dictcol,
     # )
-    # to_int = T.ConvertImageDtype(torch.uint8)
+    to_int = T.ConvertImageDtype(torch.uint8)
 
+    zip_file = None
+    if zip_write:
+        zip_file = ZipFile(str(output_path), "a", compression = 0)
+
+        @contextlib.contextmanager
+        def make_outfile(name, suffix):
+            filename = zip_find_filepath(zip_file, name, suffix)
+            with zip_file.open(filename, "w") as file:
+                yield file
+    else:
+        @contextlib.contextmanager
+        def make_outfile(name, suffix):
+            with atomic(find_filepath(output_path, name, suffix)) as fp:
+                with open(str(fp), "wb") as file:
+                    yield file
 
     for pos, (names, batch) in progress(enumerate(train_dataloader)):
         # show_images((batch / 2 + 0.5).clamp(0, 1).cpu())
@@ -240,12 +252,17 @@ def main_convert(args):
         assert len(batch) == bs
         for name, lt, pixels in zip(names, latents, batch):
             if lt is not None:
-                with atomic(find_filepath(output_path, name, ".pt")) as fp:
+                with make_outfile(name, ".pt") as fp:
                     torch.save(lt, fp)
+
             if save_image:
                 write_pixels = (pixels / 2 + 0.5).clamp(0, 1)
-                with atomic(find_filepath(output_path, name, ".png")) as fp:
-                    write_png(to_int(write_pixels.to("cpu")), str(fp), 0)
+                png_data = encode_png(to_int(write_pixels.to("cpu")), 0)
+                with make_outfile(name, ".png") as fp:
+                    fp.write(bytearray(png_data.numpy()))
+
+    if zip_file is not None:
+        zip_file.close()
 
 
 @contextlib.contextmanager
@@ -261,6 +278,17 @@ def atomic(filepath, verbose = False):
     if verbose:
         print("moving {!r} -> {!r}".format(str(tmp), str(filepath)))
     os.rename(tmp, filepath)
+
+
+def zip_find_filepath(zip: ZipFile, name_start: str, ext: str, max_tries = 1024) -> str:
+    option = None
+    names = set(zip.namelist())
+    for i in range(1, max_tries + 1):
+        name = f"{name_start}.{i}{ext}"
+        if name not in names:
+            return name
+
+    raise ValueError("reached max tries, couldnt find filename", zip, name_start, ext, option, max_tries)
 
 
 def find_filepath(output_path: Path, name_start: str, ext: str, max_tries = 1024) -> Path:
@@ -297,6 +325,7 @@ def main_show(args):
     else:
         device = 'mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu'
 
+    args.zip_path = "/Volumes/dataaaaaa/MacintoshSSD_move/info/images/hilbp2/sdwork_hilb/weird/al/latents.zip"
     ds = LatentZipDataset(args.zip_path)
     train_dataloader = DataLoader(
         ds,
@@ -309,6 +338,7 @@ def main_show(args):
     vae = vae.to(device)
 
     for batch in train_dataloader:
+        # continue
         latents = batch["latents"]
         image = vae.decode(latents.to(device))
         image = image.sample
@@ -323,6 +353,39 @@ def main_show(args):
 
         # show_images(batch)
         show_images((image / 2 + 0.5).clamp(0, 1).cpu())
+    pass
+
+
+def main_vae(args):
+    size = args.size
+    sized = [
+        transforms.Resize(size, interpolation = transforms.InterpolationMode.BILINEAR, antialias = True),
+        transforms.CenterCrop(size),
+    ] if size else []
+    tfms = transforms.Compose([
+        transforms.ConvertImageDtype(torch.float32),
+        *sized,
+        transforms.Normalize([0.5], [0.5]),
+    ])
+
+    torch.set_grad_enabled(False)
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = 'mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    vae = AutoencoderKL.from_pretrained(args.vae_name_or_path, subfolder = args.vae_subfolder)
+    vae = vae.to(device)
+
+    image = read_image(args.input_image_path, ImageReadMode.RGB)
+    image = tfms(image)
+    image = image[None,]
+
+    latents = vae.encode(image.to(vae.device)).latent_dist.sample()
+    image = vae.decode(latents.to(device))
+
+    print(image)
+
     pass
 
 
@@ -357,6 +420,19 @@ def setup_args(argv = None):
     show_parser.add_argument("--vae_subfolder")
     show_parser.add_argument("-b", "--batch_size", type = int, default = 1)
     show_parser.add_argument("-d", "--device")
+
+    vae_parser = subp.add_parser("vae")
+    vae_parser.set_defaults(fn = main_vae)
+    vae_parser.add_argument("-P", "--vae_name_or_path", default = "stabilityai/sd-vae-ft-mse")
+    vae_parser.add_argument("--vae_subfolder")
+    vae_parser.add_argument("input_image_path")
+    vae_parser.add_argument("output_image_path")
+    vae_parser.add_argument("-s", "--size", default = 0)
+    # vae_parser.add_argument("-P", "--vae_name_or_path", default = "stabilityai/sd-vae-ft-mse")
+    # vae_parser.add_argument("--vae_subfolder")
+    # vae_parser.add_argument("-b", "--batch_size", type = int, default = 1)
+    vae_parser.add_argument("-d", "--device")
+    pass
 
     return parser.parse_args(argv) if argv else parser.parse_args()
 

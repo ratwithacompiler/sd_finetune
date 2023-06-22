@@ -17,7 +17,7 @@
 Features:
 
 """
-
+import copy
 import os
 import time
 
@@ -44,6 +44,7 @@ import torch.utils.checkpoint
 import torch.utils.data
 import transformers
 import transformers.utils.logging
+import omegaconf
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -59,9 +60,10 @@ from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, DPMSolver
 
 from diffusers.utils import is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
+from diffusers.pipelines.stable_diffusion.convert_from_ckpt import download_from_original_stable_diffusion_ckpt
 
 from arguments import parse_args
-from dataload import PromptDataset, DreamBoothDataset, TransformedDataset, transforms_random_crop, StaticDataset, LatentZipDataset
+from dataload import PromptDataset, DreamBoothDataset, TransformedDataset, transforms_random_crop, StaticDataset, LatentZipDataset, RepeatedDataset
 from utils import Timer, Timed, timed_wrapper, _make_cached_caller_targ
 
 from fastai.callback.core import Callback, CancelBackwardException
@@ -137,7 +139,7 @@ def clean_mem():
 
 @torch.no_grad()
 def log_validation(
-        text_encoder, tokenizer, unet, vae, args, accelerator, epoch, vae_dtype,
+        model_name, text_encoder, tokenizer, unet, vae, args, accelerator, epoch, vae_dtype,
         pipeline = None,
         num_inference_steps = 30,
 ):
@@ -154,7 +156,7 @@ def log_validation(
         vaeargs = dict(vae = accelerator.unwrap_model(vae)) if vae else { }
         # create pipeline (note: unet and vae are loaded again in float32)
         pipeline = DiffusionPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
+            model_name,
             text_encoder = accelerator.unwrap_model(text_encoder),
             tokenizer = tokenizer,
             unet = accelerator.unwrap_model(unet),
@@ -296,7 +298,9 @@ class TrainContext():
     reg_dataload: Any = None
     model: "Model" = None
     args: any = None
-    accelerator: Any = None
+    accelerator: accelerate.Accelerator = None
+    diffusers_model_name: str = None
+    optimizer: Any = None
     global_step: Any = None
     global_train_images: Any = None
     global_reg_images: Any = None
@@ -332,16 +336,34 @@ def load_tokenizer(args):
     if args.tokenizer_name:
         return AutoTokenizer.from_pretrained(args.tokenizer_name, revision = args.revision, use_fast = False)
 
-    if args.pretrained_model_name_or_path:
+    model_name_path = args.pretrained_model_name_or_path
+    if model_name_path:
+        if os.path.isfile(model_name_path):
+            model_name_path = args.fallback_pretrained_model_name_or_path
+            logger.info("pretrained_model_name_path_or_path is file, assuming original SD checkpoint, "
+                        "loading default clip tokenizer from fallback_pretrained_model_name_or_path %r, model_path: %r",
+                        model_name_path, args.pretrained_model_name_or_path)
+
         return AutoTokenizer.from_pretrained(
-            args.pretrained_model_name_or_path,
+            model_name_path,
             subfolder = "tokenizer",
             revision = args.revision,
             use_fast = False,
         )
 
 
-def load_model(args, add_vae = True):
+def load_model(args, tokenizer, add_vae = True):
+    model_name_path = args.pretrained_model_name_or_path
+    # if model_name_path.endswith(".ckpt") or model_name_path.endswith(".safetensors"):
+    if os.path.isfile(model_name_path):
+        logger.info("pretrained_model_name_or_path is file, assuming original SD checkpoint: %r", model_name_path)
+        pipe = download_from_original_stable_diffusion_ckpt(
+            model_name_path,
+            from_safetensors = bool(model_name_path.count("safetensors")),
+            load_safety_checker = False,
+        )
+        return TrainContext(pipe.unet, tokenizer, pipe.text_encoder, pipe.vae, pipe.scheduler, diffusers_model_name = args.fallback_pretrained_model_name_or_path)
+
     # Load scheduler and models
     text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
     text_encoder = text_encoder_cls.from_pretrained(
@@ -355,15 +377,15 @@ def load_model(args, add_vae = True):
         vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder = "vae", revision = args.revision, resume_download = True, )
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder = "scheduler")
 
-    return TrainContext(unet, None, text_encoder, vae, noise_scheduler)
+    return TrainContext(unet, tokenizer, text_encoder, vae, noise_scheduler, diffusers_model_name = model_name_path
+                        )
 
 
-def load_dev_model(args, add_vae):
+def load_dev_model(args, tokenizer, add_vae):
     # make small random compatible models for development
 
     from transformers import CLIPTextConfig
     unet = UNet2DConditionModel(block_out_channels = (4, 4, 4, 4), cross_attention_dim = 16, norm_num_groups = 4, attention_head_dim = 1)
-    tokenizer = load_tokenizer(args)
     text_encoder = CLIPTextModel(CLIPTextConfig(hidden_size = 16, intermediate_size = 16))
     vae = None
     if add_vae:
@@ -461,9 +483,9 @@ def init(ctx: TrainContext):
                 elif isinstance(model, CLIPTextModel):
                     sub_dir = "text_encoder"
                 elif isinstance(model, AutoencoderKL):
+                    sub_dir = "vae"
                     if args.checkpointing_skip_vae:
                         print("skipping saving vae")
-                        sub_dir = "vae"
                         weights.pop()
                         continue
                 else:
@@ -546,6 +568,11 @@ def make_dataloaders(args, tokenizer, with_prior_preservation, img_batch_size, r
     else:
         col = collate_fn
 
+    if args.instance_image_repeat and args.instance_image_repeat > 1:
+        maybe_repeat = lambda ds: RepeatedDataset(ds, args.instance_image_repeat)
+    else:
+        maybe_repeat = lambda ds: ds
+
     need_vae = False
     if args.instance_latent_zip:
         assert args.instance_data_dir is None, "both latent_zip and instance_dir"
@@ -554,6 +581,7 @@ def make_dataloaders(args, tokenizer, with_prior_preservation, img_batch_size, r
             instance_prompt = args.instance_prompt,
             tokenizer = tokenizer,
         )
+        train_dataset = maybe_repeat(train_dataset)
 
         train_dataloader = DataLoader(
             train_dataset,
@@ -570,6 +598,7 @@ def make_dataloaders(args, tokenizer, with_prior_preservation, img_batch_size, r
             instance_prompt = args.instance_prompt,
             tokenizer = tokenizer,
         )
+        train_dataset = maybe_repeat(train_dataset)
         train_dataloader = DataLoader(
             TransformedDataset(train_dataset, transforms_random_crop(args.resolution)),
             batch_size = img_batch_size,
@@ -815,7 +844,9 @@ class Trainer(Callback):
                 if ctx.args.validation_clean:
                     self.learn.opt.zero_grad(set_to_none = True)
 
-                log_validation(ctx.text_encoder, ctx.tokenizer, ctx.unet, ctx.vae, ctx.args, ctx.accelerator, self.learn.epoch, ctx.weight_dtype)
+                log_validation(ctx.diffusers_model_name, ctx.text_encoder, ctx.tokenizer, ctx.unet, ctx.vae, ctx.args,
+                               ctx.accelerator, self.learn.epoch, ctx.weight_dtype,
+                               num_inference_steps = ctx.args.validation_sample_steps)
 
                 if ctx.args.validation_clean and not ctx.args.set_grads_to_none:
                     self.learn.opt.zero_grad(set_to_none = False)
@@ -978,6 +1009,7 @@ class TqdmProgressCB(Callback):
 class Model(torch.nn.Module):
     def __init__(self, ctx: TrainContext, add_all = False):
         super().__init__()
+        assert ctx.model is None
         ctx.model = self
         self.ctx = ctx
         self.learn = None
@@ -1067,9 +1099,8 @@ def setup1(args, devmodel = False):
         tokenizer = load_tokenizer(args)
         train_dataloader, train_reg_dataloader, dl_need_vae = make_dataloaders(args, tokenizer, with_prior_preservation, img_batch_size, reg_batch_size, True)
         print("dl_need_vae", dl_need_vae)
-        ctx = load_model(args, dl_need_vae) if not devmodel else load_dev_model(args, dl_need_vae)
+        ctx = load_model(args, tokenizer, dl_need_vae) if not devmodel else load_dev_model(args, tokenizer, dl_need_vae)
         ctx.train_dataloader, ctx.train_reg_dataloader = train_dataloader, train_reg_dataloader
-        ctx.tokenizer = load_tokenizer(args)
         ctx.set_cached(not args.train_text_encoder)
         if ctx.vae is not None:
             ctx.vae.requires_grad_(False)
@@ -1085,7 +1116,7 @@ def setup1(args, devmodel = False):
     return ctx
 
 
-def setup2(ctx: TrainContext, init_trackers = True):
+def setup2(ctx: TrainContext, init_trackers = True, add_logger = False):
     accelerator, args = ctx.accelerator, ctx.args
     # Prepare everything with our `accelerator`.
     ctx.unet, ctx.vae = accelerator.prepare(ctx.unet, ctx.vae)
@@ -1224,6 +1255,21 @@ def setup2(ctx: TrainContext, init_trackers = True):
             else:
                 if not hasattr(accelerator, "trackers"):
                     accelerator.trackers = []
+
+            if add_logger or IS_DEV:
+                from accelerate.tracking import GeneralTracker
+                class LogTracker(GeneralTracker):
+                    name = "LogTracker"
+                    requires_logging_directory = False
+
+                    def __init__(self):
+                        self.tracker = object()
+                        super().__init__()
+
+                    def log(self, values: dict, step: Optional[int], **kwargs):
+                        logger.info("accelerator log, step %s: %r, %r", step, values, kwargs)
+
+                accelerator.trackers.append(LogTracker())
     logger.info("***** Running training *****")
     logger.info(f"  is_main_process = {accelerator.is_main_process}")
     logger.info(f"  Num examples = {len(ctx.train_dataloader.dataset)}")
@@ -1276,10 +1322,16 @@ def make_optimizer(args):
     if IS_DEV:
         optimizer_class = lambda *args, betas = None, weight_decay = None, eps = None, **kwargs: torch.optim.SGD(*args, **kwargs)
 
+    weight_decay = args.adam_weight_decay
+    # if args.original_weight_decay is not None and weight_decay is not None:
+    #     logger.info("using original weight decay, ignoring adam weight decay value: %r ,owd: %r",
+    #                 weight_decay, args.original_weight_decay)
+    #     weight_decay = None
+
     opt_args = partial(
         optimizer_class,
         betas = (args.adam_beta1, args.adam_beta2),
-        weight_decay = args.adam_weight_decay,
+        weight_decay = weight_decay,
         eps = args.adam_epsilon,
     )
     return partial(OptimWrapper, opt = opt_args)
@@ -1297,6 +1349,61 @@ def get_loss_fn(callbacks, default):
     return loss_fn
 
 
+class OriginalWeightCallback(Callback):
+    run_train = True
+    run_valid = False
+
+    def __init__(self, named_org_params, named_train_params, original_weight_decay: float):
+        super().__init__()
+        self.original_weight_decay = original_weight_decay
+
+        org_by_name = { k: v for k, v in named_org_params }
+        self._items = []
+        for name, train_param in named_train_params:
+            item = (name, org_by_name[name], train_param)
+            self._items.append(item)
+
+    def after_step(self):
+        # TODI: try scaling with same factor grad is scaled at by Adam
+        if self.learn.ctx.accelerator.sync_gradients:
+            with torch.no_grad():
+                abs_diff = torch.zeros(len(self._items))
+                mean = torch.zeros(len(self._items))
+
+                for pos, (name, org_param, train_param) in enumerate(self._items):
+                    diff = org_param - train_param
+                    train_param.add_(self.original_weight_decay * diff)
+                    abs_diff[pos] = diff.abs().sum()
+                    mean[pos] = diff.mean()
+
+                self.learn.ctx.accelerator.log({
+                    "owd_abs_diff_mean": abs_diff.mean().item(),
+                    "owd_abs_diff_sum":  abs_diff.sum().item(),
+                    "owd_mean_mean":     mean.mean().item(),
+                    "owd_mean_sum":      mean.sum().item(),
+                })
+
+
+def setup3(ctx: TrainContext):
+    assert ctx.model is not None
+    callbacks = []
+
+    owd = ctx.args.original_weight_decay
+    if owd is not None:
+        half = ctx.args.mixed_precision == "fp16"
+        params = list(ctx.model.named_parameters())
+        dtype = torch.float16 if half else params[0][1].dtype
+        org_params = [(n, t.to(dtype, copy = True)) for (n, t) in ctx.model.named_parameters()]
+
+        logger.info("enabling original weight decay of %r for %r parameters, dtype: %s",
+                    owd, len(params), dtype)
+        owd = OriginalWeightCallback(org_params, params, owd)
+        callbacks.append(owd)
+        clean_mem()
+
+    return callbacks
+
+
 def main(args, run_lr_find: bool = False):
     ctx = setup1(args, devmodel = IS_DEV)
     callbacks = setup2(ctx, init_trackers = not run_lr_find)
@@ -1306,18 +1413,19 @@ def main(args, run_lr_find: bool = False):
     dls = DataLoaders(ctx.train_dataloader, val_dataset)
 
     trainercb = Trainer(ctx)
-    optim = make_optimizer(ctx.args)
+    optim_gen = make_optimizer(ctx.args)
     loss_fn = get_loss_fn(callbacks, trainercb.loss)
 
     if run_lr_find:  # or IS_DEV:
         print("lr_find")
         import fastai.callback.schedule
         args.validation_steps, args.validation_image_steps = args.checkpointing_steps = args.checkpointing_image_steps = None
-        ctx.learn = learn = Learner(dls, model, loss_fn, optim, args.learning_rate, cbs = [trainercb] + callbacks)
+        ctx.learn = learn = Learner(dls, model, loss_fn, optim_gen, args.learning_rate, cbs = [trainercb] + callbacks)
         learn.lr_find()
         return learn
 
-    optim = optim(model.parameters(), lr = args.learning_rate)
+    ctx.optimizer = optim = optim_gen(model.parameters(), lr = args.learning_rate)
+    callbacks.extend(setup3(ctx))
     ctx.learn = learn = Learner(dls, model, loss_fn, optim, args.learning_rate, cbs = [trainercb] + callbacks)
     ctx.unet.train()
     if args.train_text_encoder:
@@ -1342,7 +1450,7 @@ def main(args, run_lr_find: bool = False):
         save_path = ctx.make_save_path()
         print("done, saving to", repr(save_path))
         pipeline = DiffusionPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
+            ctx.diffusers_model_name,
             unet = accelerator.unwrap_model(ctx.unet),
             text_encoder = accelerator.unwrap_model(ctx.text_encoder),
             revision = args.revision,
